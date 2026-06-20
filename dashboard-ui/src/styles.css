@@ -1,0 +1,90 @@
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: #101314;
+}
+
+.plot-container,
+.js-plotly-plot {
+  width: 100%;
+}
+
+.topbar {
+  background: rgba(16, 19, 20, 0.92);
+  border-bottom: 1px solid #263034;
+  backdrop-filter: blur(12px);
+}
+
+.dashboard {
+  padding-top: 24px;
+  padding-bottom: 32px;
+}
+
+.login-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background:
+    linear-gradient(rgba(16, 19, 20, 0.78), rgba(16, 19, 20, 0.94)),
+    url("https://images.unsplash.com/photo-1642790106117-e829e14a795f?auto=format&fit=crop&w=1800&q=80");
+  background-size: cover;
+  background-position: center;
+}
+
+.login-panel {
+  width: min(420px, 100%);
+  padding: 28px;
+  border: 1px solid #2b3538;
+}
+
+.panel,
+.metric-tile {
+  border: 1px solid #263034;
+  background: #171b1e;
+}
+
+.panel {
+  padding: 18px;
+  min-height: 100%;
+}
+
+.table-panel {
+  overflow-x: auto;
+}
+
+.metric-tile {
+  padding: 18px;
+  min-height: 104px;
+}
+
+.metric-icon {
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  border-radius: 8px;
+  background: #20282b;
+}
+
+.metric-good .metric-icon {
+  color: #6abf69;
+}
+
+.metric-warn .metric-icon {
+  color: #e6b84a;
+}
+
+.metric-bad .metric-icon,
+.down {
+  color: #e66b5b;
+}
+
+.up {
+  color: #6abf69;
+}
