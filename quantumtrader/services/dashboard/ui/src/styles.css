@@ -1,0 +1,18 @@
+body {
+  margin: 0;
+  background: #0d1117;
+}
+
+.panel {
+  padding: 20px;
+  border-radius: 12px;
+  background: #161b22;
+  border: 1px solid #263034;
+}
+
+.metric-tile {
+  padding: 16px;
+  border-radius: 10px;
+  background: #1c2128;
+  border: 1px solid #263034;
+}

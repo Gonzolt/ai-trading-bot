@@ -1,0 +1,161 @@
+x-python-build: &python-build
+  context: .
+  dockerfile: docker/base.Dockerfile
+
+x-python-service: &python-service
+  build: *python-build
+  env_file: .env
+  volumes:
+    - ./config:/app/config:ro
+    - model_data:/app/models
+  restart: unless-stopped
+  logging: &json-logging
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-trader}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_strong_password}
+      POSTGRES_DB: ${POSTGRES_DB:-quantumtrader}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trader} -d ${POSTGRES_DB:-quantumtrader}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging: *json-logging
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    logging: *json-logging
+
+  mongo:
+    image: mongo:7
+    volumes:
+      - mongo_data:/data/db
+    logging: *json-logging
+
+  data_collector:
+    <<: *python-service
+    command: ["python", "services/data_collector/main.py"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mongo:
+        condition: service_started
+
+  signal_engine:
+    <<: *python-service
+    command: ["python", "services/signal_engine/main.py"]
+    depends_on:
+      db:
+        condition: service_healthy
+      data_collector:
+        condition: service_started
+
+  asset_scorer:
+    <<: *python-service
+    command: ["python", "services/asset_scorer/main.py"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  risk_manager:
+    <<: *python-service
+    command: ["python", "services/risk_manager/main.py"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  broker:
+    <<: *python-service
+    command: ["python", "services/broker/main.py"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      risk_manager:
+        condition: service_started
+
+  backtester:
+    <<: *python-service
+    command: ["python", "services/backtester/main.py"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  celery_worker:
+    <<: *python-service
+    command: ["celery", "-A", "quantumtrader.scheduler:celery_app", "worker", "--loglevel=INFO"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+
+  scheduler:
+    <<: *python-service
+    command: ["celery", "-A", "quantumtrader.scheduler:celery_app", "beat", "--loglevel=INFO"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      celery_worker:
+        condition: service_started
+
+  dashboard_api:
+    <<: *python-service
+    command: ["uvicorn", "quantumtrader.dashboard.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  dashboard_ui:
+    build:
+      context: .
+      dockerfile: docker/dashboard_ui.Dockerfile
+      args:
+        VITE_API_BASE_URL: /api
+        VITE_WS_BASE_URL: /ws/live
+    restart: unless-stopped
+    logging: *json-logging
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./docker/nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      - dashboard_api
+      - dashboard_ui
+    restart: unless-stopped
+    logging: *json-logging
+
+volumes:
+  postgres_data:
+  redis_data:
+  mongo_data:
+  model_data:
