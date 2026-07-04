@@ -50,7 +50,7 @@ from ta.momentum import RSIIndicator
 from ta.trend import ADXIndicator, MACD
 from ta.volatility import AverageTrueRange
 from torch import nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 try:
     import polars as pl
@@ -81,8 +81,15 @@ except ImportError:
 
 # Editable research parameters.
 DEFAULT_SYMBOLS = ["AAPL", "MSFT", "GOOGL"]
-DEFAULT_CRYPTO_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-DEFAULT_TIMEFRAME = "1Day"  # "1Day" or "1Min"
+DEFAULT_CRYPTO_SYMBOLS = [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "ADAUSDT",
+]
+DEFAULT_TIMEFRAME = "1Min"  # "1Day" or "1Min"
 DEFAULT_ASSET_CLASS = "stocks"
 STOCK_DAILY_HISTORY_DAYS = 2 * 365
 STOCK_MINUTE_HISTORY_DAYS = 90
@@ -93,10 +100,13 @@ BINANCE_PUBLIC_BASE_URL = "https://data.binance.vision/data/spot"
 LOOKBACK = 30
 FORWARD_HORIZON = 5
 MOVE_THRESHOLD = 0.002  # 0.2%
+CRYPTO_MINUTE_MOVE_THRESHOLD = 0.0005  # 0.05% over five one-minute bars
 STOCK_DAILY_MOVE_THRESHOLD = 0.005
 CRYPTO_DAILY_MOVE_THRESHOLD = 0.02
-BATCH_SIZE = 128
+BATCH_SIZE = 1024
 LEARNING_RATE = 1e-3
+LABEL_SMOOTHING = 0.05
+DROPOUT_RATE = 0.20
 CPU_THREADS = 20
 PAPER_QUANTITY = 1.0
 PAPER_POLL_SECONDS = 60
@@ -173,7 +183,7 @@ load_dotenv(ENV_PATH, override=False)
 
 def training_move_threshold(asset_class: str, timeframe: str) -> float:
     if timeframe == "1Min":
-        return MOVE_THRESHOLD
+        return CRYPTO_MINUTE_MOVE_THRESHOLD if asset_class == "crypto" else MOVE_THRESHOLD
     return (
         CRYPTO_DAILY_MOVE_THRESHOLD
         if asset_class == "crypto"
@@ -376,6 +386,35 @@ def merge_bar_frames(symbol: str, *frames: pd.DataFrame) -> pd.DataFrame:
     if not populated:
         return normalise_bar_frame(pd.DataFrame(), symbol)
     return normalise_bar_frame(pd.concat(populated, ignore_index=True), symbol)
+
+
+def resample_live_bars(
+    frame: pd.DataFrame, symbol: str, timeframe: str
+) -> pd.DataFrame:
+    """Aggregate repeated live snapshots to the model's training timeframe."""
+    if frame.empty:
+        return normalise_bar_frame(pd.DataFrame(), symbol)
+    table = frame.copy()
+    table["timestamp"] = pd.to_datetime(table["timestamp"], utc=True)
+    frequency = "1min" if timeframe == "1Min" else "1D"
+    grouped = (
+        table.set_index("timestamp")
+        .sort_index()
+        .resample(frequency)
+        .agg(
+            {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "last",
+            }
+        )
+        .dropna()
+        .reset_index()
+    )
+    grouped["symbol"] = symbol
+    return normalise_bar_frame(grouped, symbol)
 
 
 def read_cached_bars(symbol: str, timeframe: str) -> pd.DataFrame:
@@ -774,15 +813,11 @@ def engineer_features(
     )
 
     if include_target:
-        future_returns = pd.concat(
-            [close.shift(-step) / close - 1.0 for step in range(1, FORWARD_HORIZON + 1)],
-            axis=1,
-        )
-        bars["future_max_return"] = future_returns.max(axis=1)
+        bars["future_return"] = close.shift(-FORWARD_HORIZON) / close - 1.0
         bars["target"] = np.select(
             [
-                bars["future_max_return"] > move_threshold,
-                bars["future_max_return"] < -move_threshold,
+                bars["future_return"] > move_threshold,
+                bars["future_return"] < -move_threshold,
             ],
             [1, 2],
             default=0,
@@ -842,30 +877,68 @@ class DatasetBundle:
     class_counts: dict[int, int]
 
 
+def classification_metrics(
+    labels: np.ndarray, predictions: np.ndarray
+) -> tuple[float, float, list[list[int]]]:
+    """Return accuracy, macro-F1, and a 3x3 confusion matrix."""
+    labels = np.asarray(labels, dtype=np.int64)
+    predictions = np.asarray(predictions, dtype=np.int64)
+    confusion = np.zeros((3, 3), dtype=np.int64)
+    np.add.at(confusion, (labels, predictions), 1)
+    accuracy = float(np.trace(confusion) / max(confusion.sum(), 1))
+    f1_scores: list[float] = []
+    for class_id in range(3):
+        true_positive = float(confusion[class_id, class_id])
+        false_positive = float(confusion[:, class_id].sum() - true_positive)
+        false_negative = float(confusion[class_id, :].sum() - true_positive)
+        precision = true_positive / max(true_positive + false_positive, 1.0)
+        recall = true_positive / max(true_positive + false_negative, 1.0)
+        f1_scores.append(
+            2.0 * precision * recall / max(precision + recall, 1e-12)
+        )
+    return accuracy, float(np.mean(f1_scores)), confusion.tolist()
+
+
 def symbol_windows(
     frame: pd.DataFrame, move_threshold: float = MOVE_THRESHOLD
 ) -> tuple[np.ndarray, np.ndarray]:
     featured = engineer_features(
         frame, include_target=True, move_threshold=move_threshold
+    ).reset_index(drop=True)
+    returns = featured["log_return"]
+    volume_change = featured["volume_change"]
+    matrix = np.column_stack(
+        [
+            returns,
+            returns.rolling(5).mean(),
+            returns.rolling(10).mean(),
+            returns.rolling(LOOKBACK).mean(),
+            returns.rolling(5).std(),
+            returns.rolling(20).std(),
+            featured["sma_5_gap"],
+            featured["sma_10_gap"],
+            featured["sma_30_gap"],
+            featured["rsi_14"],
+            featured["macd_hist_pct"],
+            featured["atr_14_pct"],
+            volume_change.rolling(5).mean(),
+            featured["volume_ratio_5_20"],
+            featured["range_pct"],
+            featured["body_pct"],
+            featured["momentum_5"],
+            featured["momentum_20"],
+            featured["sharpe_20"],
+            np.zeros(len(featured), dtype=np.float64),
+        ]
     )
-    featured = featured.reset_index(drop=True)
-    targets = featured["target"].to_numpy()
-    windows: list[np.ndarray] = []
-    labels: list[int] = []
-    for end in range(LOOKBACK - 1, len(featured)):
-        if np.isnan(targets[end]):
-            continue
-        vector = model_feature_vector(featured, end)
-        if vector is None:
-            continue
-        windows.append(vector)
-        labels.append(int(targets[end]))
-    if not windows:
+    targets = featured["target"].to_numpy(dtype=np.float64)
+    valid = np.isfinite(matrix).all(axis=1) & np.isfinite(targets)
+    if not valid.any():
         return (
             np.empty((0, len(MODEL_FEATURES)), dtype=np.float32),
             np.empty((0,), dtype=np.int64),
         )
-    return np.stack(windows).astype(np.float32), np.asarray(labels, dtype=np.int64)
+    return matrix[valid].astype(np.float32), targets[valid].astype(np.int64)
 
 
 def build_training_dataset(
@@ -924,8 +997,10 @@ class ShallowTradeNet(nn.Module):
         self.network = nn.Sequential(
             nn.Linear(input_size, 32),
             nn.ReLU(),
+            nn.Dropout(DROPOUT_RATE),
             nn.Linear(32, 16),
             nn.ReLU(),
+            nn.Dropout(DROPOUT_RATE),
             nn.Linear(16, 3),
         )
 
@@ -1069,7 +1144,9 @@ class AgentDatabase:
             epoch INTEGER NOT NULL,
             train_loss REAL NOT NULL,
             validation_loss REAL NOT NULL,
-            validation_accuracy REAL NOT NULL
+            validation_accuracy REAL NOT NULL,
+            macro_f1 REAL NOT NULL DEFAULT 0,
+            learning_rate REAL NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS agent_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1089,6 +1166,18 @@ class AgentDatabase:
         try:
             with connection:
                 connection.executescript(schema)
+                training_columns = {
+                    row[1]
+                    for row in connection.execute("PRAGMA table_info(training_log)")
+                }
+                if "macro_f1" not in training_columns:
+                    connection.execute(
+                        "ALTER TABLE training_log ADD COLUMN macro_f1 REAL NOT NULL DEFAULT 0"
+                    )
+                if "learning_rate" not in training_columns:
+                    connection.execute(
+                        "ALTER TABLE training_log ADD COLUMN learning_rate REAL NOT NULL DEFAULT 0"
+                    )
         finally:
             connection.close()
 
@@ -1631,16 +1720,27 @@ class InvestorAgent(BaseAgent):
         )
         mean = np.asarray(self.checkpoint["mean"], dtype=np.float32)
         std = np.asarray(self.checkpoint["std"], dtype=np.float32)
+        timeframe = str(self.checkpoint.get("timeframe", "1Min"))
         for ranking in rankings:
             symbol = str(ranking["symbol"])
             rows = self.database.query(
-                "SELECT * FROM live_prices WHERE symbol=? ORDER BY timestamp DESC LIMIT 120",
+                "SELECT * FROM live_prices WHERE symbol=? ORDER BY timestamp DESC LIMIT 500",
                 (symbol,),
             )
-            if len(rows) < LOOKBACK + 5:
+            if not rows:
                 continue
-            frame = pd.DataFrame([dict(row) for row in reversed(rows)])
-            frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
+            live = resample_live_bars(
+                pd.DataFrame([dict(row) for row in reversed(rows)]),
+                symbol,
+                timeframe,
+            )
+            frame = merge_bar_frames(
+                symbol,
+                read_cached_bars(symbol, timeframe).tail(240),
+                live,
+            )
+            if len(frame) < LOOKBACK + 5:
+                continue
             model_input, timestamp, price = latest_model_input(
                 frame, mean, std, float(ranking["sentiment"])
             )
@@ -2339,6 +2439,7 @@ class MainApp:
         self.train_losses: list[float] = []
         self.validation_losses: list[float] = []
         self.validation_accuracies: list[float] = []
+        self.validation_f1_scores: list[float] = []
         self.training_epoch_numbers: list[int] = []
         self.current_epoch = 0
         self.current_batch = 0
@@ -2349,6 +2450,9 @@ class MainApp:
         self.latest_train_loss: float | None = None
         self.latest_validation_loss: float | None = None
         self.latest_accuracy: float | None = None
+        self.latest_macro_f1: float | None = None
+        self.latest_learning_rate = LEARNING_RATE
+        self.latest_confusion: list[list[int]] = []
         self.latest_class_counts = {0: 0, 1: 0, 2: 0}
         self.paper_equity_points: list[float] = []
         self.training_phase = "STATE IDLE  |  NO ACTIVE TRAINING RUN"
@@ -2933,6 +3037,7 @@ class MainApp:
         self.train_losses.clear()
         self.validation_losses.clear()
         self.validation_accuracies.clear()
+        self.validation_f1_scores.clear()
         self.training_epoch_numbers.clear()
         self.current_epoch = 0
         self.current_batch = 0
@@ -2942,6 +3047,9 @@ class MainApp:
         self.latest_train_loss = None
         self.latest_validation_loss = None
         self.latest_accuracy = None
+        self.latest_macro_f1 = None
+        self.latest_learning_rate = LEARNING_RATE
+        self.latest_confusion = []
         self.stop_training_event.clear()
         self.training = True
         self.started_at = time.monotonic()
@@ -2991,7 +3099,9 @@ class MainApp:
                     "kind": "log",
                     "text": (
                         f"FEATURE | indicators={len(FEATURE_COLUMNS)}  lookback={LOOKBACK}  "
-                        f"horizon={FORWARD_HORIZON}  threshold={move_threshold:.2%}"
+                        f"horizon={FORWARD_HORIZON}  threshold={move_threshold:.2%}  "
+                        f"dropout={DROPOUT_RATE:.0%}  smoothing={LABEL_SMOOTHING:.0%}  "
+                        "sampler=balanced"
                     ),
                 }
             )
@@ -3015,12 +3125,23 @@ class MainApp:
                 torch.from_numpy(bundle.y_validation),
             )
             generator = torch.Generator().manual_seed(42)
+            counts = np.asarray(
+                [bundle.class_counts[index] for index in range(3)], dtype=np.float64
+            )
+            sample_weights = torch.from_numpy(
+                (1.0 / counts[bundle.y_train]).astype(np.float64)
+            )
+            sampler = WeightedRandomSampler(
+                sample_weights,
+                num_samples=len(sample_weights),
+                replacement=True,
+                generator=generator,
+            )
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=BATCH_SIZE,
-                shuffle=True,
+                sampler=sampler,
                 num_workers=0,
-                generator=generator,
             )
             validation_loader = DataLoader(
                 validation_dataset,
@@ -3028,20 +3149,19 @@ class MainApp:
                 shuffle=False,
                 num_workers=0,
             )
-            counts = np.asarray(
-                [bundle.class_counts[index] for index in range(3)], dtype=np.float32
-            )
-            class_weights = counts.sum() / (3.0 * counts)
             model = ShallowTradeNet(bundle.x_train.shape[1]).to("cpu")
-            loss_function = nn.CrossEntropyLoss(
-                weight=torch.tensor(class_weights, dtype=torch.float32)
-            )
+            loss_function = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
             optimizer = torch.optim.AdamW(
                 model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4
+            )
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode="min", factor=0.5, patience=4, min_lr=1e-6
             )
             completed_epochs = 0
             best_epoch = 0
             best_validation_loss = float("inf")
+            best_macro_f1 = -1.0
+            best_confusion: list[list[int]] = []
             best_state: dict[str, torch.Tensor] | None = None
 
             def checkpoint_payload(
@@ -3065,6 +3185,11 @@ class MainApp:
                     "epochs_completed": epochs_completed,
                     "best_epoch": best_epoch,
                     "best_validation_loss": best_validation_loss,
+                    "best_macro_f1": best_macro_f1,
+                    "best_confusion_matrix": best_confusion,
+                    "label_smoothing": LABEL_SMOOTHING,
+                    "dropout_rate": DROPOUT_RATE,
+                    "balanced_sampling": True,
                     "saved_at": datetime.now(timezone.utc).isoformat(),
                 }
 
@@ -3106,7 +3231,8 @@ class MainApp:
                 model.eval()
                 validation_loss = 0.0
                 validation_seen = 0
-                correct = 0
+                validation_labels: list[np.ndarray] = []
+                validation_predictions: list[np.ndarray] = []
                 with torch.inference_mode():
                     for features, labels in validation_loader:
                         logits = model(features)
@@ -3114,10 +3240,16 @@ class MainApp:
                         size = labels.size(0)
                         validation_loss += float(loss.item()) * size
                         validation_seen += size
-                        correct += int((logits.argmax(dim=1) == labels).sum().item())
+                        validation_labels.append(labels.numpy())
+                        validation_predictions.append(logits.argmax(dim=1).numpy())
                 train_loss = running_loss / seen
                 val_loss = validation_loss / max(validation_seen, 1)
-                accuracy = correct / max(validation_seen, 1)
+                accuracy, macro_f1, confusion = classification_metrics(
+                    np.concatenate(validation_labels),
+                    np.concatenate(validation_predictions),
+                )
+                scheduler.step(val_loss)
+                learning_rate = float(optimizer.param_groups[0]["lr"])
                 completed_epochs = epoch
                 self.events.put(
                     {
@@ -3126,12 +3258,15 @@ class MainApp:
                         "train_loss": train_loss,
                         "validation_loss": val_loss,
                         "accuracy": accuracy,
+                        "macro_f1": macro_f1,
+                        "confusion": confusion,
+                        "learning_rate": learning_rate,
                     }
                 )
                 self.database.execute(
                     "INSERT INTO training_log"
-                    "(run_id,timestamp,epoch,train_loss,validation_loss,validation_accuracy) "
-                    "VALUES(?,?,?,?,?,?)",
+                    "(run_id,timestamp,epoch,train_loss,validation_loss,validation_accuracy,"
+                    "macro_f1,learning_rate) VALUES(?,?,?,?,?,?,?,?)",
                     (
                         run_id,
                         datetime.now(timezone.utc).isoformat(),
@@ -3139,6 +3274,8 @@ class MainApp:
                         train_loss,
                         val_loss,
                         accuracy,
+                        macro_f1,
+                        learning_rate,
                     ),
                 )
                 remaining_display_time = (
@@ -3147,8 +3284,13 @@ class MainApp:
                 )
                 if remaining_display_time > 0:
                     self.stop_training_event.wait(remaining_display_time)
-                if val_loss < best_validation_loss - 1e-4:
+                if macro_f1 > best_macro_f1 + 1e-4 or (
+                    abs(macro_f1 - best_macro_f1) <= 1e-4
+                    and val_loss < best_validation_loss - 1e-4
+                ):
                     best_validation_loss = val_loss
+                    best_macro_f1 = macro_f1
+                    best_confusion = confusion
                     best_epoch = epoch
                     best_state = copy.deepcopy(model.state_dict())
                 if epoch % AUTOSAVE_EPOCHS == 0 and best_state is not None:
@@ -3160,7 +3302,7 @@ class MainApp:
                             "kind": "log",
                             "text": (
                                 f"AUTOSAVE | epoch={epoch} best_epoch={best_epoch} "
-                                f"val={best_validation_loss:.5f}"
+                                f"f1={best_macro_f1:.3f} val={best_validation_loss:.5f}"
                             ),
                         }
                     )
@@ -3458,6 +3600,7 @@ class MainApp:
                     self.train_losses.append(float(event["train_loss"]))
                     self.validation_losses.append(float(event["validation_loss"]))
                     self.validation_accuracies.append(float(event["accuracy"]))
+                    self.validation_f1_scores.append(float(event["macro_f1"]))
                     self.training_epoch_numbers = self.training_epoch_numbers[
                         -MAX_CHART_EPOCHS:
                     ]
@@ -3466,15 +3609,29 @@ class MainApp:
                     self.validation_accuracies = self.validation_accuracies[
                         -MAX_CHART_EPOCHS:
                     ]
+                    self.validation_f1_scores = self.validation_f1_scores[
+                        -MAX_CHART_EPOCHS:
+                    ]
                     self.latest_train_loss = self.train_losses[-1]
                     self.latest_validation_loss = self.validation_losses[-1]
                     self.latest_accuracy = self.validation_accuracies[-1]
+                    self.latest_macro_f1 = self.validation_f1_scores[-1]
+                    self.latest_learning_rate = float(event["learning_rate"])
+                    self.latest_confusion = list(event["confusion"])
                     self._log(
                         f"EPOCH  | {event['epoch']:04d}/CONTINUOUS  "
                         f"train={self.latest_train_loss:.5f}  "
                         f"val={self.latest_validation_loss:.5f}  "
-                        f"accuracy={self.latest_accuracy:.2%}"
+                        f"accuracy={self.latest_accuracy:.2%}  "
+                        f"macro_f1={self.latest_macro_f1:.3f}  "
+                        f"lr={self.latest_learning_rate:.2e}"
                     )
+                    if int(event["epoch"]) % 5 == 0:
+                        hold_row, buy_row, sell_row = self.latest_confusion
+                        self._log(
+                            "CONFUSION | actual rows H/B/S -> "
+                            f"H={hold_row} B={buy_row} S={sell_row}"
+                        )
                 elif kind == "training_done":
                     self.training = False
                     if event["stopped"]:
@@ -3586,9 +3743,23 @@ class MainApp:
                 linewidth=0.9,
                 marker="o",
                 markersize=2.5,
+                label="accuracy",
+            )
+            self.accuracy_axes.plot(
+                epochs,
+                self.validation_f1_scores,
+                color=TEXT,
+                linewidth=0.9,
+                linestyle="--",
+                label="macro-F1",
             )
             legend = self.loss_axes.legend(loc="upper right", frameon=False, fontsize=8)
             for label in legend.get_texts():
+                label.set_color(TEXT)
+            score_legend = self.accuracy_axes.legend(
+                loc="lower right", frameon=False, fontsize=8
+            )
+            for label in score_legend.get_texts():
                 label.set_color(TEXT)
         else:
             self.loss_axes.text(
@@ -3667,9 +3838,10 @@ class MainApp:
             f"TRAIN LOSS {self._metric(self.latest_train_loss)}  |  "
             f"VAL LOSS {self._metric(self.latest_validation_loss)}  |  "
             f"VAL ACC {self._metric(self.latest_accuracy, 3)}  |  "
-            f"BATCH CLASS {SIGNAL_NAMES[self.current_batch_label]}\n"
+            f"MACRO F1 {self._metric(self.latest_macro_f1, 3)}\n"
             f"LABELS HOLD={self.latest_class_counts[0]}  BUY={self.latest_class_counts[1]}  "
-            f"SELL={self.latest_class_counts[2]}  |  OPTIMIZER ADAMW  |  LR {LEARNING_RATE:.2E}  |  CPU"
+            f"SELL={self.latest_class_counts[2]}  |  ADAMW  |  "
+            f"LR {self.latest_learning_rate:.2E}  |  CPU"
         )
 
     def _update_clock(self) -> None:

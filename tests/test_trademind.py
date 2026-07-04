@@ -39,6 +39,27 @@ def test_features_and_future_labels_are_well_formed():
     assert featured["target"].tail(app.FORWARD_HORIZON).isna().all()
 
 
+def test_target_uses_exact_forward_horizon_not_intermediate_maximum():
+    frame = market_frame("BTCUSDT")
+    index = 100
+    frame.loc[index, "close"] = 100.0
+    frame.loc[index + 1, "close"] = 110.0
+    frame.loc[index + app.FORWARD_HORIZON, "close"] = 90.0
+    featured = app.engineer_features(frame, move_threshold=0.002)
+    assert featured.loc[index, "target"] == 2
+
+
+def test_vectorized_windows_match_single_window_feature_builder():
+    frame = market_frame("AAPL")
+    featured = app.engineer_features(frame).reset_index(drop=True)
+    expected = app.model_feature_vector(
+        featured, len(featured) - app.FORWARD_HORIZON - 1
+    )
+    windows, _ = app.symbol_windows(frame)
+    assert expected is not None
+    assert np.allclose(windows[-1], expected, rtol=1e-5, atol=1e-7)
+
+
 def test_chronological_windows_and_training_only_scaler():
     frames = {
         "AAPL": market_frame("AAPL", 1),
@@ -68,6 +89,28 @@ def test_cache_round_trip(tmp_path: Path, monkeypatch):
         "close",
         "volume",
     ]
+
+
+def test_live_snapshots_are_resampled_to_model_timeframe():
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                ["2026-01-01T00:00:05Z", "2026-01-01T00:00:45Z", "2026-01-01T00:01:10Z"]
+            ),
+            "symbol": ["BTCUSDT"] * 3,
+            "open": [100.0, 100.0, 101.0],
+            "high": [101.0, 102.0, 103.0],
+            "low": [99.0, 98.0, 100.0],
+            "close": [100.5, 101.0, 102.0],
+            "volume": [10.0, 12.0, 4.0],
+        }
+    )
+    result = app.resample_live_bars(frame, "BTCUSDT", "1Min")
+    assert len(result) == 2
+    assert result.iloc[0]["high"] == 102.0
+    assert result.iloc[0]["low"] == 98.0
+    assert result.iloc[0]["close"] == 101.0
+    assert result.iloc[0]["volume"] == 12.0
 
 
 def test_shallow_network_shape_and_backpropagation():
@@ -107,6 +150,15 @@ def test_cashier_sector_mapping_recognises_alpaca_crypto_symbols():
     assert app.CashierAgent.position_sector("BTC/USD") == "Crypto"
     assert app.CashierAgent.position_sector("ETHUSD") == "Crypto"
     assert app.CashierAgent.position_sector("AAPL") == app.SECTOR_MAP["AAPL"]
+
+
+def test_macro_f1_and_confusion_matrix_are_correct():
+    labels = np.array([0, 0, 1, 1, 2, 2])
+    predictions = np.array([0, 0, 1, 2, 2, 2])
+    accuracy, macro_f1, confusion = app.classification_metrics(labels, predictions)
+    assert accuracy == 5 / 6
+    assert 0.82 < macro_f1 < 0.83
+    assert confusion == [[2, 0, 0], [0, 1, 1], [0, 0, 2]]
 
 
 def test_missing_credentials_fail_closed(monkeypatch):
@@ -163,6 +215,14 @@ def test_database_helpers_release_windows_file_handles(tmp_path: Path):
     assert database.query("SELECT COUNT(*) AS count FROM agent_logs")[0]["count"] == 1
     path.unlink()
     assert not path.exists()
+
+
+def test_training_log_schema_includes_quality_and_scheduler_metrics(tmp_path: Path):
+    database = app.AgentDatabase(tmp_path / "metrics.db")
+    columns = {
+        row["name"] for row in database.query("PRAGMA table_info(training_log)")
+    }
+    assert {"macro_f1", "learning_rate"}.issubset(columns)
 
 
 def test_massive_aggregate_response_is_normalised():

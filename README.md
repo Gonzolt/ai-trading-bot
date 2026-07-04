@@ -27,7 +27,7 @@ API keys are never committed:
 - `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY`: required for Alpaca stock streaming and paper execution.
 - `FINNHUB_API_KEY`: optional; Yahoo Finance RSS is the news fallback.
 
-Binance public crypto downloads require no key. If no Massive key exists, the app starts with `BTCUSDT`, `ETHUSDT`, and `SOLUSDT`.
+Binance public crypto downloads require no key. If no Massive key exists, the app starts with 90 days of one-minute data for `BTCUSDT`, `ETHUSDT`, `SOLUSDT`, `BNBUSDT`, `XRPUSDT`, and `ADAUSDT`.
 
 ## Workflow
 
@@ -42,7 +42,7 @@ Binance public crypto downloads require no key. If no Massive key exists, the ap
 
 Each sample uses a 30-bar lookback summarized into 20 explainable features: return horizons and volatility, SMA gaps, RSI, MACD, ATR, volume change/ratio, candle range/body, momentum, rolling Sharpe, and sentiment. The network is `20 -> 32 -> 16 -> 3` for hold, buy, and sell.
 
-Every symbol is split chronologically before concatenation. Scaler statistics are fitted only on training windows. Training uses class-weighted cross entropy and gradient clipping, and runs continuously until manually stopped. The best validation checkpoint is autosaved every ten epochs and saved again when training stops. Checkpoints are validated and atomically replaced so the Investor never reads a partially written model. Training metrics are also written to SQLite.
+Every symbol is split chronologically before concatenation. Scaler statistics are fitted only on training windows. The five-bar target uses the price exactly five bars ahead. One-minute crypto labels use a 0.05% threshold to avoid a hold-dominated dataset. Training uses balanced sampling, 20% dropout, 5% label smoothing, gradient clipping, and adaptive learning-rate reduction, and runs continuously until manually stopped. Best-model selection prioritizes validation macro-F1, with accuracy, confusion matrices, learning rate, and loss recorded in SQLite. The best checkpoint is autosaved every ten epochs and saved again when training stops. Checkpoints are validated and atomically replaced so the Investor never reads a partially written model.
 
 FinBERT is downloaded only when news is first processed and is cached under `models/finbert/`. If transformers or the model service is unavailable, the Researcher records a warning and uses a small deterministic lexical fallback instead of stopping the other agents.
 
