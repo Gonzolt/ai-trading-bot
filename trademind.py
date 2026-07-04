@@ -103,6 +103,7 @@ PAPER_QUANTITY = 1.0
 PAPER_POLL_SECONDS = 60
 VALIDATION_FRACTION = 0.20
 EARLY_STOPPING_PATIENCE = 5
+MIN_EPOCH_DISPLAY_SECONDS = 0.65
 RESEARCH_PRICE_SECONDS = 1
 RESEARCH_NEWS_SECONDS = 5 * 60
 ANALYST_SECONDS = 60
@@ -2097,9 +2098,15 @@ class NetworkSimulation:
         self.packet: int | None = None
         self.status_item: int | None = None
         self.resize_job: str | None = None
+        self.completed_until = 0.0
         self.canvas.bind("<Configure>", self._schedule_redraw)
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
         self.window.after(100, self.draw)
-        self.window.after(500, self.pulse)
+        self.window.after(200, self.pulse)
+
+    def close(self) -> None:
+        self.app.simulation_window = None
+        self.window.destroy()
 
     def _schedule_redraw(self, _event=None) -> None:
         if self.resize_job is not None:
@@ -2189,7 +2196,7 @@ class NetworkSimulation:
             20,
             height - 28,
             anchor="w",
-            text="STATE IDLE  |  FORWARD TRACE 2.0 s",
+            text=self.app.training_phase,
             fill=ACCENT,
             font=small,
         )
@@ -2225,14 +2232,16 @@ class NetworkSimulation:
     def pulse(self) -> None:
         if not self.window.winfo_exists():
             return
-        self.window.after(2000, self.pulse)
+        self.window.after(500, self.pulse)
         if not self.app.training:
             if self.packet is not None:
                 self.canvas.delete(self.packet)
                 self.packet = None
             if self.status_item is not None:
                 self.canvas.itemconfigure(
-                    self.status_item, text="STATE IDLE  |  FORWARD TRACE 2.0 s", fill=ACCENT
+                    self.status_item,
+                    text=self.app.training_phase,
+                    fill=TEXT if time.monotonic() < self.completed_until else ACCENT,
                 )
             return
         class_id = self.app.current_batch_label
@@ -2253,7 +2262,7 @@ class NetworkSimulation:
                 ),
                 fill=TEXT,
             )
-        self._animate(path, class_id, 0, 50)
+        self._animate(path, class_id, 0, 18)
 
     def _animate(self, path, class_id: int, frame: int, total: int) -> None:
         if not self.window.winfo_exists() or self.packet is None:
@@ -2273,7 +2282,14 @@ class NetworkSimulation:
         x = x1 + (x2 - x1) * fraction
         y = y1 + (y2 - y1) * fraction
         self.canvas.coords(self.packet, x - 3, y - 3, x + 3, y + 3)
-        self.window.after(25, self._animate, path, class_id, frame + 1, total)
+        self.window.after(20, self._animate, path, class_id, frame + 1, total)
+
+    def mark_complete(self) -> None:
+        self.completed_until = time.monotonic() + 5.0
+        if self.status_item is not None:
+            self.canvas.itemconfigure(
+                self.status_item, text=self.app.training_phase, fill=TEXT
+            )
 
     def _dim(self, node: int) -> None:
         if self.window.winfo_exists():
@@ -2333,6 +2349,8 @@ class MainApp:
         self.latest_accuracy: float | None = None
         self.latest_class_counts = {0: 0, 1: 0, 2: 0}
         self.paper_equity_points: list[float] = []
+        self.training_phase = "STATE IDLE  |  NO ACTIVE TRAINING RUN"
+        self.simulation_window: NetworkSimulation | None = None
 
         self._build_style()
         self._build_ui()
@@ -2674,7 +2692,7 @@ class MainApp:
             bottom, "Stop Training", self.stop_training, state="disabled"
         )
         self.simulation_button = self._button(
-            bottom, "Open Simulation", lambda: NetworkSimulation(self)
+            bottom, "Open Simulation", self.open_simulation
         )
         self.paper_button = self._button(
             bottom, "Start Paper Trading", self.toggle_paper_trading
@@ -2687,6 +2705,17 @@ class MainApp:
         )
         button.pack(side="left", padx=(0, 3))
         return button
+
+    def open_simulation(self) -> None:
+        if (
+            self.simulation_window is not None
+            and self.simulation_window.window.winfo_exists()
+        ):
+            self.simulation_window.window.deiconify()
+            self.simulation_window.window.lift()
+            self.simulation_window.window.focus_force()
+            return
+        self.simulation_window = NetworkSimulation(self)
 
     def _style_axes(self) -> None:
         for axes in (self.loss_axes, self.accuracy_axes):
@@ -2883,6 +2912,9 @@ class MainApp:
             self.train_after_download = True
             self.training = True
             self.stop_training_event.clear()
+            self.training_phase = (
+                "STATE PREPARING DATA  |  DOWNLOADING MISSING TRAINING CACHE"
+            )
             self.status_var.set("STATE  DOWNLOADING FOR TRAINING")
             self._set_controls(True)
             self._log(
@@ -2913,7 +2945,8 @@ class MainApp:
         training_symbols = tuple(self.symbols)
         training_asset_class = self.asset_class
         training_timeframe = self.timeframe
-        self.status_var.set("STATE  PREPARING TRAINING")
+        self.training_phase = "STATE INITIALIZING  |  BUILDING FEATURE WINDOWS"
+        self.status_var.set("STATE  TRAINING / INITIALIZING")
         self._log(
             f"TRAIN  | started asset={training_asset_class} timeframe={training_timeframe} "
             f"symbols={','.join(training_symbols)}"
@@ -2932,6 +2965,7 @@ class MainApp:
         if not self.training or self.stop_training_event.is_set():
             return
         self.stop_training_event.set()
+        self.training_phase = "STATE STOPPING  |  FINISHING CURRENT BATCH"
         self.stop_button.configure(state="disabled")
         self._log("STOP   | training stop queued; current batch will complete")
 
@@ -3010,6 +3044,7 @@ class MainApp:
             for epoch in range(1, EPOCHS + 1):
                 if self.stop_training_event.is_set():
                     break
+                epoch_started_at = time.monotonic()
                 model.train()
                 running_loss = 0.0
                 seen = 0
@@ -3079,6 +3114,12 @@ class MainApp:
                         accuracy,
                     ),
                 )
+                remaining_display_time = (
+                    MIN_EPOCH_DISPLAY_SECONDS
+                    - (time.monotonic() - epoch_started_at)
+                )
+                if remaining_display_time > 0:
+                    self.stop_training_event.wait(remaining_display_time)
                 if val_loss < best_validation_loss - 1e-4:
                     best_validation_loss = val_loss
                     best_epoch = epoch
@@ -3379,6 +3420,10 @@ class MainApp:
                         self.root.after(100, self.start_training)
                 elif kind == "training_setup":
                     self.status_var.set("STATE  TRAINING")
+                    self.training_phase = (
+                        "STATE TRAINING  |  LIVE FORWARD PASSES  |  "
+                        f"{event['train_rows']} TRAIN / {event['validation_rows']} VALIDATION"
+                    )
                     self.latest_class_counts = dict(event["class_counts"])
                     self._log(
                         f"SPLIT  | train={event['train_rows']}  validation={event['validation_rows']}  "
@@ -3392,9 +3437,17 @@ class MainApp:
                     self.current_batch_label = int(event["label"])
                     self.latest_train_loss = float(event["loss"])
                     self.elapsed_seconds = float(event["elapsed"])
+                    epoch_fraction = self.current_batch / max(self.batches_per_epoch, 1)
                     self.progress_var.set(
-                        100.0 * self.current_batch / max(self.batches_per_epoch, 1)
+                        100.0 * ((self.current_epoch - 1) + epoch_fraction) / EPOCHS
                     )
+                    if self.current_batch in (1, self.batches_per_epoch):
+                        self._log(
+                            f"BATCH  | epoch={self.current_epoch:02d}  "
+                            f"batch={self.current_batch:04d}/{self.batches_per_epoch:04d}  "
+                            f"loss={self.latest_train_loss:.5f}  "
+                            f"class={SIGNAL_NAMES[self.current_batch_label]}"
+                        )
                 elif kind == "epoch_metrics":
                     self.train_losses.append(float(event["train_loss"]))
                     self.validation_losses.append(float(event["validation_loss"]))
@@ -3412,10 +3465,15 @@ class MainApp:
                     self.training = False
                     if event["stopped"]:
                         self.status_var.set("STATE  TRAINING STOPPED")
+                        self.training_phase = "STATE STOPPED  |  TRAINING CANCELLED"
                     else:
                         self.progress_var.set(100.0)
                         self.status_var.set(
                             f"STATE  MODEL READY / BEST EPOCH {event.get('best_epoch', '--')}"
+                        )
+                        self.training_phase = (
+                            "STATE COMPLETE  |  MODEL READY  |  "
+                            f"BEST EPOCH {event.get('best_epoch', '--')}"
                         )
                     self._set_controls(False)
                     self._log(event["text"])
@@ -3423,6 +3481,8 @@ class MainApp:
                         self._log(
                             "TRAIN  | COMPLETE; early stopping is normal and the best checkpoint is active"
                         )
+                    if self.simulation_window is not None:
+                        self.simulation_window.mark_complete()
                     self._refresh_meta()
                 elif kind == "rankings":
                     for item in self.rankings_table.get_children():
@@ -3468,6 +3528,9 @@ class MainApp:
                 elif kind == "error":
                     self.training = False
                     self.train_after_download = False
+                    self.training_phase = (
+                        f"STATE ERROR  |  {event['context'].upper()}: {event['text']}"
+                    )
                     self.status_var.set("STATE  ERROR")
                     self._set_controls(False)
                     self._log(f"ERROR  | {event['context']}: {event['text']}")
@@ -3619,6 +3682,8 @@ def main() -> None:
             pass
     torch.set_num_threads(CPU_THREADS)
     root = tk.Tk()
+    if os.getenv("TRADEMIND_START_MINIMIZED") == "1":
+        root.iconify()
     MainApp(root)
     root.mainloop()
 
