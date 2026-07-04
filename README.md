@@ -44,6 +44,8 @@ Each sample uses a 30-bar lookback summarized into 20 explainable features: retu
 
 Every symbol is split chronologically before concatenation. Scaler statistics are fitted only on training windows. The five-bar target uses the price exactly five bars ahead. One-minute crypto labels use a 0.05% threshold to avoid a hold-dominated dataset. Training uses balanced sampling, 20% dropout, 5% label smoothing, gradient clipping, and adaptive learning-rate reduction, and runs continuously until manually stopped. Best-model selection prioritizes validation macro-F1, with accuracy, confusion matrices, learning rate, and loss recorded in SQLite. The best checkpoint is autosaved every ten epochs and saved again when training stops. Checkpoints are validated and atomically replaced so the Investor never reads a partially written model.
 
+Checkpoints contain tensors and JSON-safe primitives only and are loaded with PyTorch's restricted `weights_only=True` mode. Trading is limited to the model's recorded symbols and asset class. Stock entries use whole-share native Alpaca bracket orders, while filled crypto entries retain stale-price-aware client-side stops because Alpaca does not support crypto brackets. Broker order states are reconciled into SQLite before synthetic risk monitoring.
+
 FinBERT is downloaded only when news is first processed and is cached under `models/finbert/`. If transformers or the model service is unavailable, the Researcher records a warning and uses a small deterministic lexical fallback instead of stopping the other agents.
 
 Generated caches, SQLite files, models, logs, `.env`, and the virtual environment are excluded from Git.

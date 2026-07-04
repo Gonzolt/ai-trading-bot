@@ -19,10 +19,11 @@ import zipfile
 import xml.etree.ElementTree as ET
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Callable, TypeVar
+from zoneinfo import ZoneInfo
 
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ.setdefault("OMP_NUM_THREADS", "20")
@@ -41,8 +42,13 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestBarRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
-from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
+from alpaca.trading.enums import OrderClass, OrderSide, OrderStatus, QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import (
+    GetOrdersRequest,
+    MarketOrderRequest,
+    StopLossRequest,
+    TakeProfitRequest,
+)
 from dotenv import load_dotenv
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
@@ -108,13 +114,11 @@ LEARNING_RATE = 1e-3
 LABEL_SMOOTHING = 0.05
 DROPOUT_RATE = 0.20
 CPU_THREADS = 20
-PAPER_QUANTITY = 1.0
-PAPER_POLL_SECONDS = 60
 VALIDATION_FRACTION = 0.20
 MIN_EPOCH_DISPLAY_SECONDS = 0.65
 AUTOSAVE_EPOCHS = 10
 MAX_CHART_EPOCHS = 500
-RESEARCH_PRICE_SECONDS = 1
+RESEARCH_PRICE_SECONDS = 2
 RESEARCH_NEWS_SECONDS = 5 * 60
 ANALYST_SECONDS = 60
 UNIVERSE_SECONDS = 60 * 60
@@ -124,6 +128,16 @@ MAX_DAILY_LOSS = 0.02
 MAX_GLOBAL_DRAWDOWN = 0.20
 RISK_PER_TRADE = 0.01
 MAX_ASSET_ALLOCATION = 0.25
+MAX_POSITIONS_PER_SECTOR = 2
+MAX_CRYPTO_POSITIONS = 3
+TRADE_TRAINED_SYMBOLS_ONLY = True
+MIN_SIGNAL_CONFIDENCE = 0.45
+DECISION_COOLDOWN_SECONDS = 60
+MIN_ORDER_QUANTITY = 0.0001
+CRYPTO_RETRY_SECONDS = 60
+MAX_PRICE_AGE_SECONDS = 180
+ASSET_STOCK = "stock"
+ASSET_CRYPTO = "crypto"
 
 ROOT = Path(__file__).resolve().parent
 CACHE_DIR = ROOT / "market_cache"
@@ -177,6 +191,26 @@ SECTOR_MAP = {
     "NVDA": "Technology",
     "TSLA": "Consumer",
 }
+
+
+def normalize_asset_type(value: str) -> str:
+    normalized = str(value).lower()
+    if normalized in {"stock", "stocks"}:
+        return ASSET_STOCK
+    if normalized in {"crypto", "cryptos"}:
+        return ASSET_CRYPTO
+    return normalized
+
+
+def us_trading_day(timestamp: datetime) -> date:
+    """Map a timestamp to the US session whose risk window is currently active."""
+    eastern = timestamp.astimezone(ZoneInfo("America/New_York"))
+    candidate = eastern.date()
+    if (eastern.hour, eastern.minute) < (9, 30):
+        candidate -= timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate -= timedelta(days=1)
+    return candidate
 
 load_dotenv(ENV_PATH, override=False)
 
@@ -407,7 +441,7 @@ def resample_live_bars(
                 "high": "max",
                 "low": "min",
                 "close": "last",
-                "volume": "last",
+                "volume": "sum",
             }
         )
         .dropna()
@@ -1030,9 +1064,12 @@ def save_checkpoint_atomic(checkpoint: dict, path: Path = MODEL_PATH) -> None:
     """Write and validate a checkpoint before atomically replacing the live model."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
+    safe_checkpoint = dict(checkpoint)
+    for field in ("mean", "std"):
+        safe_checkpoint[field] = np.asarray(safe_checkpoint[field]).tolist()
     try:
-        torch.save(checkpoint, temporary)
-        loaded = torch.load(temporary, map_location="cpu", weights_only=False)
+        torch.save(safe_checkpoint, temporary)
+        loaded = torch.load(temporary, map_location="cpu", weights_only=True)
         if int(loaded.get("input_size", 0)) != len(MODEL_FEATURES):
             raise UserFacingError("Checkpoint validation failed: unexpected input size.")
         if list(loaded.get("feature_columns", [])) != MODEL_FEATURES:
@@ -1121,7 +1158,9 @@ class AgentDatabase:
             stop_loss REAL NOT NULL,
             take_profit REAL NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
-            note TEXT NOT NULL DEFAULT ''
+            note TEXT NOT NULL DEFAULT '',
+            client_order_id TEXT NOT NULL DEFAULT '',
+            filled_quantity REAL NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_decision_status
             ON investment_decisions(status, timestamp);
@@ -1159,6 +1198,7 @@ class AgentDatabase:
             symbol TEXT PRIMARY KEY,
             asset_type TEXT NOT NULL,
             name TEXT NOT NULL DEFAULT '',
+            sector TEXT NOT NULL DEFAULT 'Other',
             updated_at TEXT NOT NULL
         );
         """
@@ -1177,6 +1217,30 @@ class AgentDatabase:
                 if "learning_rate" not in training_columns:
                     connection.execute(
                         "ALTER TABLE training_log ADD COLUMN learning_rate REAL NOT NULL DEFAULT 0"
+                    )
+                universe_columns = {
+                    row[1]
+                    for row in connection.execute("PRAGMA table_info(universe_assets)")
+                }
+                if "sector" not in universe_columns:
+                    connection.execute(
+                        "ALTER TABLE universe_assets ADD COLUMN sector TEXT NOT NULL DEFAULT 'Other'"
+                    )
+                decision_columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(investment_decisions)"
+                    )
+                }
+                if "client_order_id" not in decision_columns:
+                    connection.execute(
+                        "ALTER TABLE investment_decisions ADD COLUMN "
+                        "client_order_id TEXT NOT NULL DEFAULT ''"
+                    )
+                if "filled_quantity" not in decision_columns:
+                    connection.execute(
+                        "ALTER TABLE investment_decisions ADD COLUMN "
+                        "filled_quantity REAL NOT NULL DEFAULT 0"
                     )
         finally:
             connection.close()
@@ -1347,7 +1411,7 @@ class ResearcherAgent(BaseAgent):
         self.sentiment = FinBERTSentiment()
         self.stock_client = None
         self.missing_stock_credentials_logged = False
-        self.invalid_crypto_symbols: set[str] = set()
+        self.crypto_retry_after: dict[str, float] = {}
 
     def run(self) -> None:
         next_prices = 0.0
@@ -1393,19 +1457,20 @@ class ResearcherAgent(BaseAgent):
             request = StockLatestBarRequest(symbol_or_symbols=stocks, feed=DataFeed.IEX)
             bars = self.stock_client.get_stock_latest_bar(request)
             for symbol, bar in bars.items():
-                self._store_bar(symbol, "stock", bar)
+                self._store_bar(symbol, ASSET_STOCK, bar)
         except UserFacingError:
             if not self.missing_stock_credentials_logged:
                 self.log("Alpaca keys missing; stock stream paused, crypto remains active", "WARN")
                 self.missing_stock_credentials_logged = True
         if requests is None:
             return
-        for symbol in crypto_symbols[:5]:
-            if symbol in self.invalid_crypto_symbols:
+        now = time.monotonic()
+        for symbol in crypto_symbols:
+            if now < self.crypto_retry_after.get(symbol, 0.0):
                 continue
             try:
                 response = requests.get(
-                    "https://api.binance.com/api/v3/klines",
+                    "https://data-api.binance.vision/api/v3/klines",
                     params={"symbol": symbol, "interval": "1m", "limit": 1},
                     timeout=10,
                 )
@@ -1416,7 +1481,7 @@ class ResearcherAgent(BaseAgent):
                     "(symbol,asset_type,timestamp,open,high,low,close,volume) VALUES(?,?,?,?,?,?,?,?)",
                     (
                         symbol,
-                        "crypto",
+                        ASSET_CRYPTO,
                         pd.to_datetime(item[0], unit="ms", utc=True).isoformat(),
                         float(item[1]),
                         float(item[2]),
@@ -1426,8 +1491,11 @@ class ResearcherAgent(BaseAgent):
                     ),
                 )
             except Exception as exc:
-                self.invalid_crypto_symbols.add(symbol)
-                self.log(f"crypto symbol disabled {symbol}: {exc}", "WARN")
+                self.crypto_retry_after[symbol] = time.monotonic() + CRYPTO_RETRY_SECONDS
+                self.log(
+                    f"crypto symbol cooldown {symbol} for {CRYPTO_RETRY_SECONDS}s: {exc}",
+                    "WARN",
+                )
 
     def fetch_news(self) -> None:
         stocks, _ = self.watchlist.snapshot()
@@ -1454,7 +1522,14 @@ class ResearcherAgent(BaseAgent):
                 content = http_get_bytes(url, context=f"Yahoo RSS {symbol}", missing_ok=True)
                 if not content:
                     continue
-                root = ET.fromstring(content)
+                if len(content) > 2_000_000:
+                    self.log(f"Yahoo RSS payload too large for {symbol}", "WARN")
+                    continue
+                try:
+                    root = ET.fromstring(content)
+                except ET.ParseError as exc:
+                    self.log(f"Yahoo RSS parse failed for {symbol}: {exc}", "WARN")
+                    continue
                 for item in root.findall(".//item")[:10]:
                     headline = (item.findtext("title") or "").strip()
                     if headline:
@@ -1607,7 +1682,7 @@ class AnalystAgent(BaseAgent):
         self.log(f"ranked assets={len(top)} leader={top.iloc[0]['symbol']}")
 
     def refresh_universe(self) -> None:
-        rows: list[tuple[str, str, str, str]] = []
+        rows: list[tuple[str, str, str, str, str]] = []
         timestamp = datetime.now(timezone.utc).isoformat()
         try:
             wikipedia_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
@@ -1622,8 +1697,14 @@ class AnalystAgent(BaseAgent):
                 response.raise_for_status()
                 sp500 = pd.read_html(io.StringIO(response.text))[0]
             rows.extend(
-                (str(row.Symbol).replace(".", "-"), "stock", str(row.Security), timestamp)
-                for row in sp500.itertuples()
+                (
+                    str(row["Symbol"]).replace(".", "-"),
+                    ASSET_STOCK,
+                    str(row["Security"]),
+                    str(row["GICS Sector"]),
+                    timestamp,
+                )
+                for _, row in sp500.iterrows()
             )
         except Exception as exc:
             self.log(f"S&P 500 universe refresh skipped: {exc}", "WARN")
@@ -1650,21 +1731,18 @@ class AnalystAgent(BaseAgent):
                 rows.extend(
                     (
                         f"{str(item['symbol']).upper()}USDT",
-                        "crypto",
+                        ASSET_CRYPTO,
                         str(item["name"]),
+                        "Crypto",
                         timestamp,
                     )
                     for item in tradable_coins
                 )
-                top_five = [
-                    f"{str(item['symbol']).upper()}USDT" for item in tradable_coins[:5]
-                ]
-                with self.watchlist.lock:
-                    self.watchlist.crypto = top_five
             except Exception as exc:
                 self.log(f"CoinGecko universe refresh skipped: {exc}", "WARN")
         self.database.executemany(
-            "INSERT OR REPLACE INTO universe_assets(symbol,asset_type,name,updated_at) VALUES(?,?,?,?)",
+            "INSERT OR REPLACE INTO universe_assets"
+            "(symbol,asset_type,name,sector,updated_at) VALUES(?,?,?,?,?)",
             rows,
         )
         if rows:
@@ -1684,9 +1762,11 @@ class InvestorAgent(BaseAgent):
         self.model_mtime_ns = 0
         self.last_missing_log = 0.0
         self.last_decision: dict[str, float] = {}
+        self.skipped_untrained: set[str] = set()
+        self.stock_data_client = None
 
     def _load_model(self) -> None:
-        checkpoint = torch.load(MODEL_PATH, map_location="cpu", weights_only=False)
+        checkpoint = torch.load(MODEL_PATH, map_location="cpu", weights_only=True)
         model = ShallowTradeNet(int(checkpoint["input_size"]))
         model.load_state_dict(checkpoint["state_dict"])
         model.eval()
@@ -1723,26 +1803,59 @@ class InvestorAgent(BaseAgent):
         timeframe = str(self.checkpoint.get("timeframe", "1Min"))
         for ranking in rankings:
             symbol = str(ranking["symbol"])
+            trained_symbols = {
+                str(item).upper() for item in self.checkpoint.get("symbols", [])
+            }
+            trained_asset = normalize_asset_type(
+                str(self.checkpoint.get("asset_class", ""))
+            )
+            ranked_asset = normalize_asset_type(str(ranking["asset_type"]))
+            if TRADE_TRAINED_SYMBOLS_ONLY and (
+                symbol.upper() not in trained_symbols or ranked_asset != trained_asset
+            ):
+                if symbol not in self.skipped_untrained:
+                    self.skipped_untrained.add(symbol)
+                    self.log(
+                        f"skipping untrained asset {symbol} ({ranked_asset}); "
+                        f"model={trained_asset} {sorted(trained_symbols)}",
+                        "WARN",
+                    )
+                continue
             rows = self.database.query(
                 "SELECT * FROM live_prices WHERE symbol=? ORDER BY timestamp DESC LIMIT 500",
                 (symbol,),
             )
             if not rows:
                 continue
-            live = resample_live_bars(
-                pd.DataFrame([dict(row) for row in reversed(rows)]),
-                symbol,
-                timeframe,
-            )
-            frame = merge_bar_frames(
-                symbol,
-                read_cached_bars(symbol, timeframe).tail(240),
-                live,
-            )
+            if ranked_asset == ASSET_STOCK:
+                if self.stock_data_client is None:
+                    key, secret = api_credentials()
+                    self.stock_data_client = StockHistoricalDataClient(key, secret)
+                frame = fetch_alpaca_execution_bars(
+                    self.stock_data_client,
+                    symbol,
+                    timeframe,
+                    normalise_bar_frame(pd.DataFrame(), symbol),
+                    self.events,
+                )
+            else:
+                live = resample_live_bars(
+                    pd.DataFrame([dict(row) for row in reversed(rows)]),
+                    symbol,
+                    timeframe,
+                )
+                frame = merge_bar_frames(
+                    symbol,
+                    read_cached_bars(symbol, timeframe).tail(240),
+                    live,
+                )
             if len(frame) < LOOKBACK + 5:
                 continue
             model_input, timestamp, price = latest_model_input(
-                frame, mean, std, float(ranking["sentiment"])
+                frame,
+                mean,
+                std,
+                0.0,  # Training sentiment is constant zero; ranking sentiment stays separate.
             )
             with torch.inference_mode():
                 probabilities = torch.softmax(
@@ -1750,13 +1863,16 @@ class InvestorAgent(BaseAgent):
                 )[0]
             signal = int(probabilities.argmax().item())
             probability = float(probabilities[signal].item())
-            if signal == 0 or probability < 0.45:
+            if signal == 0 or probability < MIN_SIGNAL_CONFIDENCE:
                 continue
             now = time.monotonic()
-            if now - self.last_decision.get(symbol, 0.0) < 60:
+            if now - self.last_decision.get(symbol, 0.0) < DECISION_COOLDOWN_SECONDS:
                 continue
-            featured = engineer_features(frame, include_target=False).dropna()
-            atr = float(featured.iloc[-1]["atr_14_pct"] * price)
+            featured = engineer_features(frame, include_target=False)
+            atr_values = featured["atr_14_pct"].dropna()
+            if atr_values.empty:
+                continue
+            atr = float(atr_values.iloc[-1] * price)
             stop = price - 2 * atr if signal == 1 else price + 2 * atr
             target = price + 3 * atr if signal == 1 else price - 3 * atr
             self.database.execute(
@@ -1790,25 +1906,30 @@ class CashierAgent(BaseAgent):
         self.client = None
         self.start_equity = 0.0
         self.peak_equity = 0.0
-        self.equity_day = datetime.now(timezone.utc).date()
+        self.equity_day = us_trading_day(datetime.now(timezone.utc))
         self.halted = False
         self.last_market_closed_log = 0.0
+        self.trained_symbols: set[str] = set()
+        self.trained_asset = ""
+        self.last_stale_price_log: dict[str, float] = {}
 
     @staticmethod
     def alpaca_symbol(symbol: str, asset_type: str) -> str:
-        if asset_type == "crypto" and symbol.endswith("USDT"):
+        if normalize_asset_type(asset_type) == ASSET_CRYPTO and symbol.endswith("USDT"):
             return f"{symbol[:-4]}/USD"
         return symbol
 
-    @staticmethod
-    def position_sector(symbol: str) -> str:
+    def position_sector(self, symbol: str) -> str:
         normalized = symbol.upper().replace("/", "")
         if normalized.endswith(("USD", "USDT", "USDC")):
             return "Crypto"
-        return SECTOR_MAP.get(normalized, "Other")
+        rows = self.database.query(
+            "SELECT sector FROM universe_assets WHERE symbol=? LIMIT 1", (normalized,)
+        )
+        return str(rows[0]["sector"]) if rows else SECTOR_MAP.get(normalized, "Other")
 
     def _reset_daily_baseline(self, equity: float) -> None:
-        today = datetime.now(timezone.utc).date()
+        today = us_trading_day(datetime.now(timezone.utc))
         if today != self.equity_day:
             self.equity_day = today
             self.start_equity = equity
@@ -1825,8 +1946,15 @@ class CashierAgent(BaseAgent):
             )
             if bool(account.trading_blocked):
                 raise UserFacingError("The Alpaca paper account is blocked from trading.")
+            checkpoint = torch.load(MODEL_PATH, map_location="cpu", weights_only=True)
+            self.trained_symbols = {
+                str(symbol).upper() for symbol in checkpoint.get("symbols", [])
+            }
+            self.trained_asset = normalize_asset_type(
+                str(checkpoint.get("asset_class", ""))
+            )
             self.start_equity = self.peak_equity = float(account.equity)
-            self.equity_day = datetime.now(timezone.utc).date()
+            self.equity_day = us_trading_day(datetime.now(timezone.utc))
         except Exception as exc:
             self.log(f"paper connection failed: {exc}", "ERROR")
             self.events.put(
@@ -1867,7 +1995,10 @@ class CashierAgent(BaseAgent):
             for position in positions
             if self.position_sector(str(position.symbol)) == sector
         )
-        if same_sector >= 2:
+        position_limit = (
+            MAX_CRYPTO_POSITIONS if sector == "Crypto" else MAX_POSITIONS_PER_SECTOR
+        )
+        if same_sector >= position_limit:
             return False, f"sector position limit reached: {sector}"
         return True, "approved"
 
@@ -1883,8 +2014,19 @@ class CashierAgent(BaseAgent):
             "SELECT * FROM investment_decisions WHERE status='pending' ORDER BY id LIMIT 10"
         )
         for decision in decisions:
-            asset_type = str(decision["asset_type"])
-            if asset_type == "stocks":
+            asset_type = normalize_asset_type(str(decision["asset_type"]))
+            decision_symbol = str(decision["symbol"]).upper()
+            if TRADE_TRAINED_SYMBOLS_ONLY and (
+                decision_symbol not in self.trained_symbols
+                or asset_type != self.trained_asset
+            ):
+                self.database.execute(
+                    "UPDATE investment_decisions SET status='rejected', note=? WHERE id=?",
+                    ("symbol or asset type is outside trained universe", decision["id"]),
+                )
+                self.log(f"{decision_symbol} rejected: outside trained universe", "WARN")
+                continue
+            if asset_type == ASSET_STOCK:
                 clock = call_with_backoff(
                     self.client.get_clock, self.events, "paper market clock"
                 )
@@ -1905,7 +2047,7 @@ class CashierAgent(BaseAgent):
                 )
                 self.log(f"{decision['symbol']} rejected: {note}", "WARN")
                 continue
-            symbol = self.alpaca_symbol(str(decision["symbol"]), asset_type)
+            symbol = self.alpaca_symbol(decision_symbol, asset_type)
             positions = call_with_backoff(
                 self.client.get_all_positions, self.events, "paper positions"
             )
@@ -1931,13 +2073,22 @@ class CashierAgent(BaseAgent):
             risk_quantity = (equity * RISK_PER_TRADE) / (2.0 * atr)
             cap_quantity = (equity * MAX_ASSET_ALLOCATION) / float(decision["price"])
             quantity = min(risk_quantity, cap_quantity)
-            if not math.isfinite(quantity) or quantity < 0.0001:
+            if asset_type == ASSET_STOCK:
+                quantity = float(math.floor(quantity))
+                if quantity < 1:
+                    self.database.execute(
+                        "UPDATE investment_decisions SET status='rejected', note=? WHERE id=?",
+                        ("stock bracket sizing is below one whole share", decision["id"]),
+                    )
+                    continue
+            if not math.isfinite(quantity) or quantity < MIN_ORDER_QUANTITY:
                 self.database.execute(
                     "UPDATE investment_decisions SET status='rejected', note=? WHERE id=?",
                     ("calculated quantity is below minimum", decision["id"]),
                 )
                 continue
             signal = str(decision["signal"])
+            client_order_id = ""
             if signal == "SELL":
                 if not matching_positions:
                     self.database.execute(
@@ -1965,15 +2116,36 @@ class CashierAgent(BaseAgent):
                         ("position already open", decision["id"]),
                     )
                     continue
-                request = MarketOrderRequest(
-                    symbol=symbol,
-                    qty=quantity,
-                    side=OrderSide.BUY,
-                    time_in_force=(
-                        TimeInForce.GTC if decision["asset_type"] == "crypto" else TimeInForce.DAY
+                client_order_id = f"korvax-{decision['id']}-{int(time.time())}"
+                request_arguments = {
+                    "symbol": symbol,
+                    "qty": quantity,
+                    "side": OrderSide.BUY,
+                    "time_in_force": (
+                        TimeInForce.GTC
+                        if asset_type == ASSET_CRYPTO
+                        else TimeInForce.DAY
                     ),
-                    client_order_id=f"korvax-{decision['id']}-{int(time.time())}",
-                )
+                    "client_order_id": client_order_id,
+                }
+                if asset_type == ASSET_STOCK:
+                    entry = float(decision["price"])
+                    stop_price = round(float(decision["stop_loss"]), 2)
+                    take_profit = round(float(decision["take_profit"]), 2)
+                    if not stop_price < entry < take_profit:
+                        self.database.execute(
+                            "UPDATE investment_decisions SET status='rejected', note=? WHERE id=?",
+                            ("invalid stock bracket prices", decision["id"]),
+                        )
+                        continue
+                    request_arguments.update(
+                        {
+                            "order_class": OrderClass.BRACKET,
+                            "take_profit": TakeProfitRequest(limit_price=take_profit),
+                            "stop_loss": StopLossRequest(stop_price=stop_price),
+                        }
+                    )
+                request = MarketOrderRequest(**request_arguments)
                 order = call_with_backoff(
                     lambda: self.client.submit_order(order_data=request),
                     self.events,
@@ -1982,8 +2154,8 @@ class CashierAgent(BaseAgent):
             order_id = str(getattr(order, "id", ""))
             final_status = "closed" if signal == "SELL" else "submitted"
             self.database.execute(
-                "UPDATE investment_decisions SET status=?, note=? WHERE id=?",
-                (final_status, order_id, decision["id"]),
+                "UPDATE investment_decisions SET status=?, note=?, client_order_id=? WHERE id=?",
+                (final_status, order_id, client_order_id, decision["id"]),
             )
             pnl = equity - self.start_equity
             self.database.execute(
@@ -2019,8 +2191,51 @@ class CashierAgent(BaseAgent):
             )
             self.log(f"paper {signal} submitted {symbol} qty={quantity:.6g}")
 
+    def reconcile_orders(self) -> None:
+        assert self.client is not None
+        decisions = self.database.query(
+            "SELECT * FROM investment_decisions "
+            "WHERE status IN ('submitted','partially_filled') AND client_order_id<>''"
+        )
+        terminal_rejections = {
+            OrderStatus.REJECTED.value,
+            OrderStatus.CANCELED.value,
+            OrderStatus.EXPIRED.value,
+            OrderStatus.DONE_FOR_DAY.value,
+        }
+        for decision in decisions:
+            client_order_id = str(decision["client_order_id"])
+            order = call_with_backoff(
+                lambda: self.client.get_order_by_client_id(client_order_id),
+                self.events,
+                f"reconcile order {client_order_id}",
+            )
+            raw_status = getattr(order, "status", "")
+            status = str(getattr(raw_status, "value", raw_status)).lower()
+            filled_quantity = float(getattr(order, "filled_qty", 0) or 0)
+            if status == OrderStatus.FILLED.value:
+                self.database.execute(
+                    "UPDATE investment_decisions SET status='filled', filled_quantity=?, note=? "
+                    "WHERE id=?",
+                    (filled_quantity, f"broker status={status}", decision["id"]),
+                )
+            elif status == OrderStatus.PARTIALLY_FILLED.value:
+                self.database.execute(
+                    "UPDATE investment_decisions SET status='partially_filled', "
+                    "filled_quantity=?, note=? WHERE id=?",
+                    (filled_quantity, f"broker status={status}", decision["id"]),
+                )
+            elif status in terminal_rejections:
+                reason = str(getattr(order, "reject_reason", "") or status)
+                self.database.execute(
+                    "UPDATE investment_decisions SET status='rejected', note=? WHERE id=?",
+                    (f"broker {status}: {reason}", decision["id"]),
+                )
+                self.log(f"order {client_order_id} reconciled as {status}", "WARN")
+
     def monitor_risk(self) -> None:
         assert self.client is not None
+        self.reconcile_orders()
         account = call_with_backoff(
             self.client.get_account, self.events, "paper account"
         )
@@ -2031,14 +2246,34 @@ class CashierAgent(BaseAgent):
             self.halted = True
             self.log("20% drawdown reached; new orders halted", "ERROR")
         decisions = self.database.query(
-            "SELECT * FROM investment_decisions WHERE status='submitted' AND signal='BUY'"
+            "SELECT * FROM investment_decisions "
+            "WHERE status='filled' AND signal='BUY' AND asset_type=?",
+            (ASSET_CRYPTO,),
         )
         for decision in decisions:
             latest = self.database.query(
-                "SELECT close FROM live_prices WHERE symbol=? ORDER BY timestamp DESC LIMIT 1",
+                "SELECT timestamp,close FROM live_prices WHERE symbol=? "
+                "ORDER BY timestamp DESC LIMIT 1",
                 (decision["symbol"],),
             )
             if not latest:
+                continue
+            price_time = pd.Timestamp(latest[0]["timestamp"])
+            if price_time.tzinfo is None:
+                price_time = price_time.tz_localize("UTC")
+            age = (
+                pd.Timestamp.now(tz="UTC") - price_time.tz_convert("UTC")
+            ).total_seconds()
+            if age > MAX_PRICE_AGE_SECONDS:
+                symbol = str(decision["symbol"])
+                now = time.monotonic()
+                if now - self.last_stale_price_log.get(symbol, 0.0) >= 60:
+                    self.last_stale_price_log[symbol] = now
+                    self.log(
+                        f"stale crypto price for {symbol} age={age:.0f}s; "
+                        "synthetic stop deferred",
+                        "WARN",
+                    )
                 continue
             price = float(latest[0]["close"])
             stop = float(decision["stop_loss"])
@@ -2431,9 +2666,7 @@ class MainApp:
         self.paper_running = False
         self.closing = False
         self.stop_training_event = threading.Event()
-        self.stop_paper_event = threading.Event()
         self.operation_thread: threading.Thread | None = None
-        self.paper_thread: threading.Thread | None = None
         self.train_after_download = False
 
         self.train_losses: list[float] = []
@@ -3164,6 +3397,47 @@ class MainApp:
             best_confusion: list[list[int]] = []
             best_state: dict[str, torch.Tensor] | None = None
 
+            if MODEL_PATH.exists():
+                saved = torch.load(MODEL_PATH, map_location="cpu", weights_only=True)
+                resume_compatible = (
+                    list(saved.get("feature_columns", [])) == FEATURE_COLUMNS
+                    and int(saved.get("input_size", 0)) == bundle.x_train.shape[1]
+                    and normalize_asset_type(str(saved.get("asset_class", "")))
+                    == normalize_asset_type(asset_class)
+                    and str(saved.get("timeframe", "")) == timeframe
+                    and list(saved.get("symbols", [])) == list(symbols)
+                    and np.allclose(saved.get("mean"), bundle.mean, rtol=1e-6, atol=1e-8)
+                    and np.allclose(saved.get("std"), bundle.std, rtol=1e-6, atol=1e-8)
+                )
+                if resume_compatible:
+                    model.load_state_dict(saved["state_dict"])
+                    completed_epochs = int(saved.get("epochs_completed", 0))
+                    best_epoch = int(saved.get("best_epoch", completed_epochs))
+                    best_validation_loss = float(
+                        saved.get("best_validation_loss", float("inf"))
+                    )
+                    best_macro_f1 = float(saved.get("best_macro_f1", -1.0))
+                    best_confusion = list(saved.get("best_confusion_matrix", []))
+                    best_state = copy.deepcopy(model.state_dict())
+                    resume_lr = float(saved.get("learning_rate", LEARNING_RATE))
+                    optimizer.param_groups[0]["lr"] = resume_lr
+                    self.events.put(
+                        {
+                            "kind": "log",
+                            "text": (
+                                f"RESUME | epoch={completed_epochs} best_epoch={best_epoch} "
+                                f"macro_f1={best_macro_f1:.3f} lr={resume_lr:.2e}"
+                            ),
+                        }
+                    )
+                else:
+                    self.events.put(
+                        {
+                            "kind": "log",
+                            "text": "RESUME | saved model does not match current data; starting fresh",
+                        }
+                    )
+
             def checkpoint_payload(
                 state_dict: dict[str, torch.Tensor], epochs_completed: int
             ) -> dict:
@@ -3177,7 +3451,7 @@ class MainApp:
                     "forward_horizon": FORWARD_HORIZON,
                     "move_threshold": move_threshold,
                     "symbols": list(symbols),
-                    "asset_class": asset_class,
+                    "asset_class": normalize_asset_type(asset_class),
                     "training_source": (
                         "Massive/Yahoo" if asset_class == "stocks" else "Binance Public"
                     ),
@@ -3190,10 +3464,11 @@ class MainApp:
                     "label_smoothing": LABEL_SMOOTHING,
                     "dropout_rate": DROPOUT_RATE,
                     "balanced_sampling": True,
+                    "learning_rate": float(optimizer.param_groups[0]["lr"]),
                     "saved_at": datetime.now(timezone.utc).isoformat(),
                 }
 
-            epoch = 0
+            epoch = completed_epochs
             while not self.stop_training_event.is_set():
                 epoch += 1
                 epoch_started_at = time.monotonic()
@@ -3386,169 +3661,6 @@ class MainApp:
             self.database, self.events, self.cashier_stop
         )
         self.cashier_agent.start()
-
-    def _position_or_none(self, client: TradingClient, symbol: str):
-        try:
-            return call_with_backoff(
-                lambda: client.get_open_position(symbol), self.events, f"position {symbol}"
-            )
-        except APIError as exc:
-            status = api_status_code(exc)
-            if status == 404 or "position does not exist" in str(exc).lower():
-                return None
-            raise
-
-    def _paper_worker(self) -> None:
-        try:
-            key, secret = api_credentials()
-            data_client = StockHistoricalDataClient(key, secret)
-            trading_client = TradingClient(key, secret, paper=True)
-            checkpoint = torch.load(MODEL_PATH, map_location="cpu", weights_only=False)
-            if list(checkpoint.get("feature_columns", [])) != FEATURE_COLUMNS:
-                raise UserFacingError("trade_model.pt uses a different feature schema; retrain it.")
-            if int(checkpoint.get("lookback", 0)) != LOOKBACK:
-                raise UserFacingError("trade_model.pt uses a different lookback; retrain it.")
-            model = ShallowTradeNet(int(checkpoint["input_size"]))
-            model.load_state_dict(checkpoint["state_dict"])
-            model.eval()
-            mean = np.asarray(checkpoint["mean"], dtype=np.float32)
-            std = np.asarray(checkpoint["std"], dtype=np.float32)
-            timeframe = str(checkpoint["timeframe"])
-            if str(checkpoint.get("asset_class", "stocks")) != "stocks":
-                raise UserFacingError(
-                    "This model was trained on crypto. Alpaca paper execution is currently enabled for US-stock models only."
-                )
-            symbol = self.symbols[0]
-            trained_symbols = [str(item).upper() for item in checkpoint.get("symbols", [])]
-            if symbol not in trained_symbols:
-                raise UserFacingError(
-                    f"{symbol} was not in the model's training universe: "
-                    + ", ".join(trained_symbols)
-                )
-            account = call_with_backoff(trading_client.get_account, self.events, "account")
-            if bool(account.trading_blocked):
-                raise UserFacingError("The Alpaca paper account is blocked from trading.")
-            starting_equity = float(account.equity)
-            last_processed: pd.Timestamp | None = None
-            market_closed_logged = False
-            self.events.put(
-                {
-                    "kind": "log",
-                    "text": (
-                        f"PAPER  | endpoint=paper  symbol={symbol}  timeframe={timeframe}  "
-                        f"qty={PAPER_QUANTITY:g}"
-                    ),
-                }
-            )
-            while not self.stop_paper_event.is_set():
-                clock = call_with_backoff(trading_client.get_clock, self.events, "market clock")
-                if not bool(clock.is_open):
-                    if not market_closed_logged:
-                        self.events.put(
-                            {
-                                "kind": "log",
-                                "text": f"PAPER  | market closed  next_open={clock.next_open}",
-                            }
-                        )
-                        market_closed_logged = True
-                    self.stop_paper_event.wait(PAPER_POLL_SECONDS)
-                    continue
-                market_closed_logged = False
-                base_bars = read_cached_bars(symbol, timeframe)
-                bars = fetch_alpaca_execution_bars(
-                    data_client, symbol, timeframe, base_bars, self.events
-                )
-                model_input, timestamp, price = latest_model_input(bars, mean, std)
-                if last_processed is not None and timestamp <= last_processed:
-                    self.stop_paper_event.wait(PAPER_POLL_SECONDS)
-                    continue
-                last_processed = timestamp
-                with torch.inference_mode():
-                    logits = model(torch.from_numpy(model_input).unsqueeze(0))
-                    probabilities = torch.softmax(logits, dim=1)[0]
-                    signal = int(probabilities.argmax().item())
-                    confidence = float(probabilities[signal].item())
-
-                position = self._position_or_none(trading_client, symbol)
-                position_side = str(getattr(position, "side", "")).lower()
-                is_long = position is not None and "long" in position_side
-                position_qty = abs(float(position.qty)) if is_long else 0.0
-                action = "NONE"
-                open_orders = call_with_backoff(
-                    lambda: trading_client.get_orders(
-                        filter=GetOrdersRequest(
-                            status=QueryOrderStatus.OPEN, symbols=[symbol]
-                        )
-                    ),
-                    self.events,
-                    f"open orders {symbol}",
-                )
-                if position is not None and not is_long:
-                    action = "SKIP NON-LONG POSITION"
-                elif open_orders:
-                    action = "WAIT OPEN ORDER"
-                elif signal == 1 and position_qty == 0:
-                    order = MarketOrderRequest(
-                        symbol=symbol,
-                        qty=PAPER_QUANTITY,
-                        side=OrderSide.BUY,
-                        time_in_force=TimeInForce.DAY,
-                        client_order_id=f"trademind-buy-{int(time.time())}",
-                    )
-                    call_with_backoff(
-                        lambda: trading_client.submit_order(order_data=order),
-                        self.events,
-                        "paper buy",
-                    )
-                    action = f"BUY {PAPER_QUANTITY:g}"
-                elif signal == 2 and position_qty > 0:
-                    order = MarketOrderRequest(
-                        symbol=symbol,
-                        qty=position_qty,
-                        side=OrderSide.SELL,
-                        time_in_force=TimeInForce.DAY,
-                        client_order_id=f"trademind-sell-{int(time.time())}",
-                    )
-                    call_with_backoff(
-                        lambda: trading_client.submit_order(order_data=order),
-                        self.events,
-                        "paper sell",
-                    )
-                    action = f"SELL {position_qty:g}"
-                account = call_with_backoff(trading_client.get_account, self.events, "account")
-                equity = float(account.equity)
-                pnl = equity - starting_equity
-                self.events.put(
-                    {
-                        "kind": "paper_row",
-                        "values": (
-                            timestamp.strftime("%Y-%m-%d %H:%M"),
-                            symbol,
-                            SIGNAL_NAMES[signal],
-                            f"{confidence:.1%}",
-                            f"{price:.2f}",
-                            f"{position_qty:g}",
-                            f"{equity:.2f}",
-                            f"{pnl:+.2f}",
-                            action,
-                        ),
-                    }
-                )
-                self.events.put(
-                    {
-                        "kind": "log",
-                        "text": (
-                            f"PAPER  | {symbol} signal={SIGNAL_NAMES[signal]} "
-                            f"confidence={confidence:.1%} action={action}"
-                        ),
-                    }
-                )
-                self.stop_paper_event.wait(PAPER_POLL_SECONDS)
-            self.events.put({"kind": "paper_done", "text": "PAPER  | loop stopped"})
-        except Exception as exc:
-            self.events.put(
-                {"kind": "paper_error", "context": "Paper trading", "text": str(exc)}
-            )
 
     def _poll_events(self) -> None:
         try:
