@@ -950,9 +950,35 @@ def latest_model_input(
     return scaled, pd.Timestamp(last["timestamp"]), float(last["close"])
 
 
+def save_checkpoint_atomic(checkpoint: dict, path: Path = MODEL_PATH) -> None:
+    """Write and validate a checkpoint before atomically replacing the live model."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        torch.save(checkpoint, temporary)
+        loaded = torch.load(temporary, map_location="cpu", weights_only=False)
+        if int(loaded.get("input_size", 0)) != len(MODEL_FEATURES):
+            raise UserFacingError("Checkpoint validation failed: unexpected input size.")
+        if list(loaded.get("feature_columns", [])) != MODEL_FEATURES:
+            raise UserFacingError("Checkpoint validation failed: feature schema mismatch.")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 # ---------------------------------------------------------------------------
 # SQLite message bus
 # ---------------------------------------------------------------------------
+
+
+class ClosingSQLiteConnection(sqlite3.Connection):
+    """Commit/rollback like sqlite3, then release the Windows file handle."""
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        try:
+            return bool(super().__exit__(exc_type, exc_value, traceback))
+        finally:
+            self.close()
 
 
 class AgentDatabase:
@@ -962,7 +988,9 @@ class AgentDatabase:
         self._initialize()
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=10.0)
+        connection = sqlite3.connect(
+            self.path, timeout=10.0, factory=ClosingSQLiteConnection
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=NORMAL")
@@ -1056,23 +1084,38 @@ class AgentDatabase:
             updated_at TEXT NOT NULL
         );
         """
-        with self.connect() as connection:
-            connection.executescript(schema)
+        connection = self.connect()
+        try:
+            with connection:
+                connection.executescript(schema)
+        finally:
+            connection.close()
 
     def execute(self, sql: str, parameters: tuple = ()) -> int:
-        with self.connect() as connection:
-            cursor = connection.execute(sql, parameters)
-            return int(cursor.lastrowid or 0)
+        connection = self.connect()
+        try:
+            with connection:
+                cursor = connection.execute(sql, parameters)
+                return int(cursor.lastrowid or 0)
+        finally:
+            connection.close()
 
     def executemany(self, sql: str, rows: list[tuple]) -> None:
         if not rows:
             return
-        with self.connect() as connection:
-            connection.executemany(sql, rows)
+        connection = self.connect()
+        try:
+            with connection:
+                connection.executemany(sql, rows)
+        finally:
+            connection.close()
 
     def query(self, sql: str, parameters: tuple = ()) -> list[sqlite3.Row]:
-        with self.connect() as connection:
+        connection = self.connect()
+        try:
             return list(connection.execute(sql, parameters).fetchall())
+        finally:
+            connection.close()
 
     def log(self, agent: str, message: str, level: str = "INFO") -> None:
         self.execute(
@@ -1326,7 +1369,13 @@ class ResearcherAgent(BaseAgent):
                     headline = (item.findtext("title") or "").strip()
                     if headline:
                         headlines.append((symbol, headline, "Yahoo RSS"))
+        inserted = 0
         for symbol, headline, source in headlines:
+            if self.database.query(
+                "SELECT 1 FROM research_findings WHERE symbol=? AND headline=? LIMIT 1",
+                (symbol, headline),
+            ):
+                continue
             label, sentiment = self.sentiment.score(headline)
             self.database.execute(
                 "INSERT OR IGNORE INTO research_findings"
@@ -1340,8 +1389,12 @@ class ResearcherAgent(BaseAgent):
                     sentiment,
                 ),
             )
-        if headlines:
-            self.log(f"news processed={len(headlines)} model={'FinBERT' if self.sentiment.model is not None else 'lexical fallback'}")
+            inserted += 1
+        if inserted:
+            self.log(
+                f"news processed={inserted} new/{len(headlines)} fetched "
+                f"model={'FinBERT' if self.sentiment.model is not None else 'lexical fallback'}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1423,7 +1476,9 @@ class AnalystAgent(BaseAgent):
         ):
             std = float(table[source].std(ddof=0))
             table[target] = (table[source] - table[source].mean()) / (std or 1.0)
-        sigmoid = lambda values: 1.0 / (1.0 + np.exp(-values))
+        def sigmoid(values):
+            return 1.0 / (1.0 + np.exp(-values))
+
         table["score"] = 100.0 * (
             0.25 * sigmoid(table["momentum_z"])
             + 0.15 * sigmoid(table["vol_ratio_z"])
@@ -1433,27 +1488,31 @@ class AnalystAgent(BaseAgent):
             + 0.25 * sigmoid(table["sharpe_60_z"])
         )
         top = table.sort_values("score", ascending=False).head(10)
-        with self.database.connect() as connection:
-            connection.execute("DELETE FROM asset_rankings")
-            connection.executemany(
-                "INSERT INTO asset_rankings VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                [
-                    (
-                        row.symbol,
-                        row.asset_type,
-                        datetime.now(timezone.utc).isoformat(),
-                        float(row.score),
-                        float(row.momentum_z),
-                        float(row.vol_ratio_z),
-                        float(row.adx),
-                        float(row.atr_pct),
-                        float(row.sentiment),
-                        float(row.sharpe_60_z),
-                        float(row.last_price),
-                    )
-                    for row in top.itertuples()
-                ],
-            )
+        connection = self.database.connect()
+        try:
+            with connection:
+                connection.execute("DELETE FROM asset_rankings")
+                connection.executemany(
+                    "INSERT INTO asset_rankings VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    [
+                        (
+                            row.symbol,
+                            row.asset_type,
+                            datetime.now(timezone.utc).isoformat(),
+                            float(row.score),
+                            float(row.momentum_z),
+                            float(row.vol_ratio_z),
+                            float(row.adx),
+                            float(row.atr_pct),
+                            float(row.sentiment),
+                            float(row.sharpe_60_z),
+                            float(row.last_price),
+                        )
+                        for row in top.itertuples()
+                    ],
+                )
+        finally:
+            connection.close()
         self.events.put({"kind": "rankings", "rows": top.to_dict("records")})
         self.log(f"ranked assets={len(top)} leader={top.iloc[0]['symbol']}")
 
@@ -1532,6 +1591,8 @@ class InvestorAgent(BaseAgent):
         super().__init__("investor", database, events, stop_event)
         self.checkpoint = None
         self.model = None
+        self.model_mtime_ns = 0
+        self.last_missing_log = 0.0
         self.last_decision: dict[str, float] = {}
 
     def _load_model(self) -> None:
@@ -1541,17 +1602,22 @@ class InvestorAgent(BaseAgent):
         model.eval()
         self.checkpoint = checkpoint
         self.model = model
+        self.model_mtime_ns = MODEL_PATH.stat().st_mtime_ns
 
     def run(self) -> None:
         self.log("agent online")
         while not self.stop_event.is_set():
             try:
-                if self.model is None:
+                current_mtime = MODEL_PATH.stat().st_mtime_ns
+                if self.model is None or current_mtime != self.model_mtime_ns:
                     self._load_model()
-                    self.log("trade model loaded")
+                    self.log("trade model loaded/reloaded")
                 self.evaluate_rankings()
             except FileNotFoundError:
-                self.log("model missing; waiting for training", "WARN")
+                now = time.monotonic()
+                if now - self.last_missing_log >= 60:
+                    self.log("model missing; waiting for training", "WARN")
+                    self.last_missing_log = now
             except Exception as exc:
                 self.log(str(exc), "ERROR")
             self.stop_event.wait(INVESTOR_SECONDS)
@@ -1623,7 +1689,9 @@ class CashierAgent(BaseAgent):
         self.client = None
         self.start_equity = 0.0
         self.peak_equity = 0.0
+        self.equity_day = datetime.now(timezone.utc).date()
         self.halted = False
+        self.last_market_closed_log = 0.0
 
     @staticmethod
     def alpaca_symbol(symbol: str, asset_type: str) -> str:
@@ -1631,13 +1699,33 @@ class CashierAgent(BaseAgent):
             return f"{symbol[:-4]}/USD"
         return symbol
 
+    @staticmethod
+    def position_sector(symbol: str) -> str:
+        normalized = symbol.upper().replace("/", "")
+        if normalized.endswith(("USD", "USDT", "USDC")):
+            return "Crypto"
+        return SECTOR_MAP.get(normalized, "Other")
+
+    def _reset_daily_baseline(self, equity: float) -> None:
+        today = datetime.now(timezone.utc).date()
+        if today != self.equity_day:
+            self.equity_day = today
+            self.start_equity = equity
+            self.halted = False
+            self.log(f"daily risk baseline reset equity={equity:.2f}")
+
     def run(self) -> None:
         self.log("agent online; endpoint=paper")
         try:
             key, secret = api_credentials()
             self.client = TradingClient(key, secret, paper=True)
-            account = self.client.get_account()
+            account = call_with_backoff(
+                self.client.get_account, self.events, "paper account"
+            )
+            if bool(account.trading_blocked):
+                raise UserFacingError("The Alpaca paper account is blocked from trading.")
             self.start_equity = self.peak_equity = float(account.equity)
+            self.equity_day = datetime.now(timezone.utc).date()
         except Exception as exc:
             self.log(f"paper connection failed: {exc}", "ERROR")
             self.events.put(
@@ -1659,6 +1747,8 @@ class CashierAgent(BaseAgent):
         self.events.put({"kind": "paper_done", "text": "CASHIER | paper execution stopped"})
 
     def _risk_allows(self, decision: sqlite3.Row, equity: float) -> tuple[bool, str]:
+        if str(decision["signal"]) == "SELL":
+            return True, "risk-reducing exit"
         if self.halted:
             return False, "risk halt active"
         if equity <= self.start_equity * (1.0 - MAX_DAILY_LOSS):
@@ -1667,12 +1757,14 @@ class CashierAgent(BaseAgent):
         if equity <= self.peak_equity * (1.0 - MAX_GLOBAL_DRAWDOWN):
             self.halted = True
             return False, "global drawdown limit reached"
-        sector = SECTOR_MAP.get(str(decision["symbol"]), "Crypto" if decision["asset_type"] == "crypto" else "Other")
-        positions = self.client.get_all_positions()
+        sector = self.position_sector(str(decision["symbol"]))
+        positions = call_with_backoff(
+            self.client.get_all_positions, self.events, "paper positions"
+        )
         same_sector = sum(
             1
             for position in positions
-            if SECTOR_MAP.get(str(position.symbol), "Other") == sector
+            if self.position_sector(str(position.symbol)) == sector
         )
         if same_sector >= 2:
             return False, f"sector position limit reached: {sector}"
@@ -1680,13 +1772,30 @@ class CashierAgent(BaseAgent):
 
     def process_pending(self) -> None:
         assert self.client is not None
-        account = self.client.get_account()
+        account = call_with_backoff(
+            self.client.get_account, self.events, "paper account"
+        )
         equity = float(account.equity)
+        self._reset_daily_baseline(equity)
         self.peak_equity = max(self.peak_equity, equity)
         decisions = self.database.query(
             "SELECT * FROM investment_decisions WHERE status='pending' ORDER BY id LIMIT 10"
         )
         for decision in decisions:
+            asset_type = str(decision["asset_type"])
+            if asset_type == "stocks":
+                clock = call_with_backoff(
+                    self.client.get_clock, self.events, "paper market clock"
+                )
+                if not bool(clock.is_open):
+                    now = time.monotonic()
+                    if now - self.last_market_closed_log >= 60:
+                        self.last_market_closed_log = now
+                        self.log(
+                            f"stock market closed; queued decisions wait until {clock.next_open}",
+                            "WARN",
+                        )
+                    continue
             allowed, note = self._risk_allows(decision, equity)
             if not allowed:
                 self.database.execute(
@@ -1695,15 +1804,52 @@ class CashierAgent(BaseAgent):
                 )
                 self.log(f"{decision['symbol']} rejected: {note}", "WARN")
                 continue
-            symbol = self.alpaca_symbol(str(decision["symbol"]), str(decision["asset_type"]))
+            symbol = self.alpaca_symbol(str(decision["symbol"]), asset_type)
+            positions = call_with_backoff(
+                self.client.get_all_positions, self.events, "paper positions"
+            )
+            normalized = symbol.upper().replace("/", "")
+            matching_positions = [
+                position
+                for position in positions
+                if str(position.symbol).upper().replace("/", "") == normalized
+            ]
+            open_orders = call_with_backoff(
+                lambda: self.client.get_orders(
+                    filter=GetOrdersRequest(
+                        status=QueryOrderStatus.OPEN, symbols=[symbol]
+                    )
+                ),
+                self.events,
+                f"open paper orders {symbol}",
+            )
+            if open_orders:
+                self.log(f"{symbol} waiting for an existing open order", "WARN")
+                continue
             atr = max(float(decision["atr"]), float(decision["price"]) * 0.001)
             risk_quantity = (equity * RISK_PER_TRADE) / (2.0 * atr)
             cap_quantity = (equity * MAX_ASSET_ALLOCATION) / float(decision["price"])
-            quantity = max(0.0001, min(risk_quantity, cap_quantity))
+            quantity = min(risk_quantity, cap_quantity)
+            if not math.isfinite(quantity) or quantity < 0.0001:
+                self.database.execute(
+                    "UPDATE investment_decisions SET status='rejected', note=? WHERE id=?",
+                    ("calculated quantity is below minimum", decision["id"]),
+                )
+                continue
             signal = str(decision["signal"])
             if signal == "SELL":
+                if not matching_positions:
+                    self.database.execute(
+                        "UPDATE investment_decisions SET status='rejected', note=? WHERE id=?",
+                        ("no long position", decision["id"]),
+                    )
+                    continue
                 try:
-                    order = self.client.close_position(symbol)
+                    order = call_with_backoff(
+                        lambda: self.client.close_position(symbol),
+                        self.events,
+                        f"close paper position {symbol}",
+                    )
                     quantity = 0.0
                 except APIError as exc:
                     self.database.execute(
@@ -1712,6 +1858,12 @@ class CashierAgent(BaseAgent):
                     )
                     continue
             else:
+                if matching_positions:
+                    self.database.execute(
+                        "UPDATE investment_decisions SET status='rejected', note=? WHERE id=?",
+                        ("position already open", decision["id"]),
+                    )
+                    continue
                 request = MarketOrderRequest(
                     symbol=symbol,
                     qty=quantity,
@@ -1721,11 +1873,16 @@ class CashierAgent(BaseAgent):
                     ),
                     client_order_id=f"korvax-{decision['id']}-{int(time.time())}",
                 )
-                order = self.client.submit_order(order_data=request)
+                order = call_with_backoff(
+                    lambda: self.client.submit_order(order_data=request),
+                    self.events,
+                    f"submit paper buy {symbol}",
+                )
             order_id = str(getattr(order, "id", ""))
+            final_status = "closed" if signal == "SELL" else "submitted"
             self.database.execute(
-                "UPDATE investment_decisions SET status='submitted', note=? WHERE id=?",
-                (order_id, decision["id"]),
+                "UPDATE investment_decisions SET status=?, note=? WHERE id=?",
+                (final_status, order_id, decision["id"]),
             )
             pnl = equity - self.start_equity
             self.database.execute(
@@ -1755,7 +1912,7 @@ class CashierAgent(BaseAgent):
                         f"{quantity:.6g}",
                         f"{equity:.2f}",
                         f"{pnl:+.2f}",
-                        "SUBMITTED",
+                        "CLOSED" if signal == "SELL" else "SUBMITTED",
                     ),
                 }
             )
@@ -1763,8 +1920,11 @@ class CashierAgent(BaseAgent):
 
     def monitor_risk(self) -> None:
         assert self.client is not None
-        account = self.client.get_account()
+        account = call_with_backoff(
+            self.client.get_account, self.events, "paper account"
+        )
         equity = float(account.equity)
+        self._reset_daily_baseline(equity)
         self.peak_equity = max(self.peak_equity, equity)
         if equity <= self.peak_equity * (1.0 - MAX_GLOBAL_DRAWDOWN):
             self.halted = True
@@ -2642,20 +2802,51 @@ class MainApp:
     def _download_worker(self) -> None:
         try:
             total = 0
+            failures: list[str] = []
             for symbol in self.symbols:
-                frame = sync_training_bars(
-                    self.asset_class, symbol, self.timeframe, self.events
+                if self.stop_training_event.is_set() and self.train_after_download:
+                    raise InterruptedError
+                try:
+                    frame = sync_training_bars(
+                        self.asset_class, symbol, self.timeframe, self.events
+                    )
+                    total += len(frame)
+                except Exception as exc:
+                    failures.append(f"{symbol}: {exc}")
+                    self.events.put(
+                        {"kind": "log", "text": f"CACHE  | {symbol} failed: {exc}"}
+                    )
+            if failures and self.train_after_download:
+                raise UserFacingError(
+                    "Training cache could not be prepared:\n" + "\n".join(failures)
                 )
-                total += len(frame)
+            source = (
+                "Massive"
+                if self.asset_class == "stocks"
+                and (os.getenv("MASSIVE_API_KEY") or os.getenv("POLYGON_API_KEY"))
+                else "Yahoo"
+                if self.asset_class == "stocks"
+                else "Binance"
+            )
             self.events.put(
                 {
                     "kind": "operation_done",
-                    "status": "IDLE",
+                    "status": "PARTIAL" if failures else "IDLE",
                     "start_training": self.train_after_download,
                     "text": (
-                        f"CACHE  | source={'Massive' if self.asset_class == 'stocks' else 'Binance'} "
-                        f"synchronization complete  total_rows={total}"
+                        f"CACHE  | source={source} synchronization complete  "
+                        f"total_rows={total} failures={len(failures)}"
                     ),
+                }
+            )
+        except InterruptedError:
+            self.events.put(
+                {
+                    "kind": "training_done",
+                    "stopped": True,
+                    "text": "STOP   | cache preparation cancelled",
+                    "best_epoch": 0,
+                    "epochs": 0,
                 }
             )
         except Exception as exc:
@@ -2668,8 +2859,21 @@ class MainApp:
             )
 
     def start_training(self) -> None:
-        if self.busy or self.paper_running:
+        if self.paper_running:
+            self._log("TRAIN  | blocked while paper execution is active")
+            messagebox.showwarning(
+                "Stop paper trading",
+                "Stop paper trading before starting a training run.",
+                parent=self.root,
+            )
             return
+        if self.training:
+            self._log("TRAIN  | a training/download run is already active")
+            return
+        if self.busy:
+            self._log("TRAIN  | another background operation is still active")
+            return
+        self.notebook.select(0)
         missing = [
             symbol
             for symbol in self.symbols
@@ -2677,6 +2881,8 @@ class MainApp:
         ]
         if missing:
             self.train_after_download = True
+            self.training = True
+            self.stop_training_event.clear()
             self.status_var.set("STATE  DOWNLOADING FOR TRAINING")
             self._set_controls(True)
             self._log(
@@ -2704,11 +2910,21 @@ class MainApp:
         self.stop_training_event.clear()
         self.training = True
         self.started_at = time.monotonic()
-        self.status_var.set("STATE  ENGINEERING")
+        training_symbols = tuple(self.symbols)
+        training_asset_class = self.asset_class
+        training_timeframe = self.timeframe
+        self.status_var.set("STATE  PREPARING TRAINING")
+        self._log(
+            f"TRAIN  | started asset={training_asset_class} timeframe={training_timeframe} "
+            f"symbols={','.join(training_symbols)}"
+        )
         self.progress_var.set(0.0)
         self._set_controls(True)
         self.operation_thread = threading.Thread(
-            target=self._training_worker, name="torch-training", daemon=True
+            target=self._training_worker,
+            args=(training_symbols, training_asset_class, training_timeframe),
+            name="torch-training",
+            daemon=True,
         )
         self.operation_thread.start()
 
@@ -2719,16 +2935,19 @@ class MainApp:
         self.stop_button.configure(state="disabled")
         self._log("STOP   | training stop queued; current batch will complete")
 
-    def _training_worker(self) -> None:
+    def _training_worker(
+        self,
+        symbols: tuple[str, ...],
+        asset_class: str,
+        timeframe: str,
+    ) -> None:
         try:
             torch.set_num_threads(CPU_THREADS)
-            run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-            move_threshold = training_move_threshold(
-                self.asset_class, self.timeframe
-            )
+            torch.manual_seed(42)
+            run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%f")
+            move_threshold = training_move_threshold(asset_class, timeframe)
             frames = {
-                symbol: read_cached_bars(symbol, self.timeframe)
-                for symbol in self.symbols
+                symbol: read_cached_bars(symbol, timeframe) for symbol in symbols
             }
             self.events.put(
                 {
@@ -2872,8 +3091,8 @@ class MainApp:
                             {
                                 "kind": "log",
                                 "text": (
-                                    f"EARLY  | no validation improvement for "
-                                    f"{EARLY_STOPPING_PATIENCE} epochs  best_epoch={best_epoch}"
+                                    f"EARLY STOP (NORMAL) | validation did not improve for "
+                                    f"{EARLY_STOPPING_PATIENCE} epochs; restoring best_epoch={best_epoch}"
                                 ),
                             }
                         )
@@ -2881,6 +3100,18 @@ class MainApp:
 
             if best_state is not None:
                 model.load_state_dict(best_state)
+
+            if completed_epochs == 0:
+                self.events.put(
+                    {
+                        "kind": "training_done",
+                        "stopped": True,
+                        "text": "STOP   | no complete epoch; existing model was preserved",
+                        "best_epoch": 0,
+                        "epochs": 0,
+                    }
+                )
+                return
 
             checkpoint = {
                 "state_dict": model.state_dict(),
@@ -2891,17 +3122,18 @@ class MainApp:
                 "lookback": LOOKBACK,
                 "forward_horizon": FORWARD_HORIZON,
                 "move_threshold": move_threshold,
-                "symbols": self.symbols.copy(),
-                "asset_class": self.asset_class,
-                "training_source": "Massive" if self.asset_class == "stocks" else "Binance Public",
-                "timeframe": self.timeframe,
+                "symbols": list(symbols),
+                "asset_class": asset_class,
+                "training_source": (
+                    "Massive/Yahoo" if asset_class == "stocks" else "Binance Public"
+                ),
+                "timeframe": timeframe,
                 "epochs_completed": completed_epochs,
                 "best_epoch": best_epoch,
                 "best_validation_loss": best_validation_loss,
                 "saved_at": datetime.now(timezone.utc).isoformat(),
             }
-            MODEL_DIR.mkdir(parents=True, exist_ok=True)
-            torch.save(checkpoint, MODEL_PATH)
+            save_checkpoint_atomic(checkpoint, MODEL_PATH)
             stopped = self.stop_training_event.is_set()
             self.events.put(
                 {
@@ -2909,8 +3141,11 @@ class MainApp:
                     "stopped": stopped,
                     "text": (
                         f"SAVE   | trade_model.pt  epochs={completed_epochs}  "
-                        f"best_epoch={best_epoch}  stopped={stopped}"
+                        f"best_epoch={best_epoch}  stopped={stopped}  "
+                        f"elapsed={time.monotonic() - self.started_at:.2f}s"
                     ),
+                    "best_epoch": best_epoch,
+                    "epochs": completed_epochs,
                 }
             )
         except InterruptedError:
@@ -3140,6 +3375,7 @@ class MainApp:
                     self._refresh_meta()
                     if event.get("start_training"):
                         self.train_after_download = False
+                        self.training = False
                         self.root.after(100, self.start_training)
                 elif kind == "training_setup":
                     self.status_var.set("STATE  TRAINING")
@@ -3174,9 +3410,19 @@ class MainApp:
                     )
                 elif kind == "training_done":
                     self.training = False
-                    self.status_var.set("STATE  STOPPED" if event["stopped"] else "STATE  FINISHED")
+                    if event["stopped"]:
+                        self.status_var.set("STATE  TRAINING STOPPED")
+                    else:
+                        self.progress_var.set(100.0)
+                        self.status_var.set(
+                            f"STATE  MODEL READY / BEST EPOCH {event.get('best_epoch', '--')}"
+                        )
                     self._set_controls(False)
                     self._log(event["text"])
+                    if not event["stopped"]:
+                        self._log(
+                            "TRAIN  | COMPLETE; early stopping is normal and the best checkpoint is active"
+                        )
                     self._refresh_meta()
                 elif kind == "rankings":
                     for item in self.rankings_table.get_children():
@@ -3318,6 +3564,8 @@ class MainApp:
     def _duration(seconds: float | None) -> str:
         if seconds is None or not math.isfinite(seconds):
             return "--:--:--"
+        if seconds < 60:
+            return f"{max(0.0, seconds):05.1f}s"
         hours, remainder = divmod(max(0, int(seconds)), 3600)
         minutes, seconds = divmod(remainder, 60)
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"

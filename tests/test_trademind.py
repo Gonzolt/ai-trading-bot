@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 
 import trademind as app
@@ -80,6 +81,34 @@ def test_shallow_network_shape_and_backpropagation():
     assert torch.isfinite(loss)
 
 
+def test_checkpoint_is_validated_and_replaced_atomically(tmp_path: Path):
+    path = tmp_path / "trade_model.pt"
+    model = app.ShallowTradeNet(len(app.MODEL_FEATURES))
+    checkpoint = {
+        "state_dict": model.state_dict(),
+        "input_size": len(app.MODEL_FEATURES),
+        "feature_columns": app.MODEL_FEATURES,
+        "mean": np.zeros(len(app.MODEL_FEATURES), dtype=np.float32),
+        "std": np.ones(len(app.MODEL_FEATURES), dtype=np.float32),
+    }
+    app.save_checkpoint_atomic(checkpoint, path)
+    loaded = torch.load(path, map_location="cpu", weights_only=False)
+    assert loaded["input_size"] == len(app.MODEL_FEATURES)
+    assert not path.with_suffix(".pt.tmp").exists()
+
+    original = path.read_bytes()
+    invalid = dict(checkpoint, input_size=999)
+    with pytest.raises(app.UserFacingError, match="unexpected input size"):
+        app.save_checkpoint_atomic(invalid, path)
+    assert path.read_bytes() == original
+
+
+def test_cashier_sector_mapping_recognises_alpaca_crypto_symbols():
+    assert app.CashierAgent.position_sector("BTC/USD") == "Crypto"
+    assert app.CashierAgent.position_sector("ETHUSD") == "Crypto"
+    assert app.CashierAgent.position_sector("AAPL") == app.SECTOR_MAP["AAPL"]
+
+
 def test_missing_credentials_fail_closed(monkeypatch):
     for name in (
         "APCA_API_KEY_ID",
@@ -125,6 +154,15 @@ def test_sqlite_agent_schema_uses_wal(tmp_path: Path):
         for row in database.query("SELECT name FROM sqlite_master WHERE type='table'")
     }
     assert expected.issubset(tables)
+
+
+def test_database_helpers_release_windows_file_handles(tmp_path: Path):
+    path = tmp_path / "releasable.db"
+    database = app.AgentDatabase(path)
+    database.log("test", "connection should close")
+    assert database.query("SELECT COUNT(*) AS count FROM agent_logs")[0]["count"] == 1
+    path.unlink()
+    assert not path.exists()
 
 
 def test_massive_aggregate_response_is_normalised():
