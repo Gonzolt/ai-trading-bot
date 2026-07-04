@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-import alpaca_trademind as app
+import trademind as app
 
 
 def market_frame(symbol: str, seed: int = 42, rows: int = 620) -> pd.DataFrame:
@@ -31,7 +31,9 @@ def market_frame(symbol: str, seed: int = 42, rows: int = 620) -> pd.DataFrame:
 
 def test_features_and_future_labels_are_well_formed():
     featured = app.engineer_features(market_frame("AAPL"))
-    assert set(app.FEATURE_COLUMNS).issubset(featured.columns)
+    vector = app.model_feature_vector(featured, 100)
+    assert vector is not None
+    assert vector.shape == (20,)
     assert featured["target"].dropna().isin([0, 1, 2]).all()
     assert featured["target"].tail(app.FORWARD_HORIZON).isna().all()
 
@@ -43,7 +45,7 @@ def test_chronological_windows_and_training_only_scaler():
         "GOOGL": market_frame("GOOGL", 3),
     }
     bundle = app.build_training_dataset(frames)
-    assert bundle.x_train.shape[1] == app.LOOKBACK * len(app.FEATURE_COLUMNS) == 300
+    assert bundle.x_train.shape[1] == len(app.MODEL_FEATURES) == 20
     assert bundle.train_rows > bundle.validation_rows > 0
     assert set(bundle.class_counts) == {0, 1, 2}
     assert np.allclose(bundle.x_train.mean(axis=0), 0.0, atol=1e-4)
@@ -68,8 +70,8 @@ def test_cache_round_trip(tmp_path: Path, monkeypatch):
 
 
 def test_shallow_network_shape_and_backpropagation():
-    model = app.ShallowTradeNet(300)
-    inputs = torch.randn(16, 300)
+    model = app.ShallowTradeNet(20)
+    inputs = torch.randn(16, 20)
     labels = torch.randint(0, 3, (16,))
     logits = model(inputs)
     loss = torch.nn.CrossEntropyLoss()(logits, labels)
@@ -103,6 +105,26 @@ def test_missing_massive_key_fails_but_binance_needs_no_credentials(monkeypatch)
         assert "Massive API key is missing" in str(exc)
     else:
         raise AssertionError("A stock download must require a Massive key")
+
+
+def test_sqlite_agent_schema_uses_wal(tmp_path: Path):
+    database = app.AgentDatabase(tmp_path / "trademind.db")
+    with database.connect() as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    expected = {
+        "live_prices",
+        "research_findings",
+        "asset_rankings",
+        "investment_decisions",
+        "portfolio_log",
+        "training_log",
+        "agent_logs",
+    }
+    tables = {
+        row["name"]
+        for row in database.query("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    assert expected.issubset(tables)
 
 
 def test_massive_aggregate_response_is_normalised():

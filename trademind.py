@@ -1,4 +1,4 @@
-"""Alpaca TradeMind Trainer: CPU market-data research and paper execution UI."""
+"""Korvax TradeMind: CPU-only multi-agent research and paper-trading desktop app."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import json
 import math
 import os
 import queue
+import sqlite3
 import threading
 import time
 import tkinter as tk
@@ -15,6 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+import xml.etree.ElementTree as ET
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -36,7 +38,7 @@ from alpaca.common.enums import Sort
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockBarsRequest, StockLatestBarRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
@@ -45,10 +47,36 @@ from dotenv import load_dotenv
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from ta.momentum import RSIIndicator
-from ta.trend import MACD
+from ta.trend import ADXIndicator, MACD
 from ta.volatility import AverageTrueRange
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
+
+try:
+    import polars as pl
+except ImportError:  # setup.bat installs it; fallback keeps diagnostics usable.
+    pl = None
+
+try:
+    import requests
+except ImportError:
+    requests = None
+
+try:
+    import finnhub
+except ImportError:
+    finnhub = None
+
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None
+
+try:
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+except ImportError:
+    AutoModelForSequenceClassification = None
+    AutoTokenizer = None
 
 
 # Editable research parameters.
@@ -75,10 +103,23 @@ PAPER_QUANTITY = 1.0
 PAPER_POLL_SECONDS = 60
 VALIDATION_FRACTION = 0.20
 EARLY_STOPPING_PATIENCE = 5
+RESEARCH_PRICE_SECONDS = 1
+RESEARCH_NEWS_SECONDS = 5 * 60
+ANALYST_SECONDS = 60
+UNIVERSE_SECONDS = 60 * 60
+INVESTOR_SECONDS = 5
+CASHIER_SECONDS = 1
+MAX_DAILY_LOSS = 0.02
+MAX_GLOBAL_DRAWDOWN = 0.20
+RISK_PER_TRADE = 0.01
+MAX_ASSET_ALLOCATION = 0.25
 
 ROOT = Path(__file__).resolve().parent
 CACHE_DIR = ROOT / "market_cache"
-MODEL_PATH = ROOT / "trade_model.pt"
+MODEL_DIR = ROOT / "models"
+MODEL_PATH = MODEL_DIR / "trade_model.pt"
+FINBERT_DIR = MODEL_DIR / "finbert"
+DB_PATH = ROOT / "trademind.db"
 ENV_PATH = ROOT / ".env"
 
 BG = "#1e1e1e"
@@ -91,19 +132,40 @@ TROUGH = "#333333"
 PROGRESS = "#888888"
 WHITE = "#ffffff"
 
-FEATURE_COLUMNS = [
-    "log_return",
-    "volatility_20",
-    "atr_14_pct",
+MODEL_FEATURES = [
+    "return_1",
+    "return_mean_5",
+    "return_mean_10",
+    "return_mean_30",
+    "return_std_5",
+    "return_std_20",
+    "price_sma_5",
+    "price_sma_10",
+    "price_sma_30",
     "rsi_14",
     "macd_hist_pct",
+    "atr_14_pct",
     "volume_change",
+    "volume_ratio_5_20",
     "range_pct",
     "body_pct",
-    "sma_10_gap",
-    "sma_30_gap",
+    "momentum_5",
+    "momentum_20",
+    "sharpe_20",
+    "sentiment",
 ]
+FEATURE_COLUMNS = MODEL_FEATURES
 SIGNAL_NAMES = {0: "HOLD", 1: "BUY", 2: "SELL"}
+
+SECTOR_MAP = {
+    "AAPL": "Technology",
+    "MSFT": "Technology",
+    "GOOGL": "Communication",
+    "AMZN": "Consumer",
+    "META": "Communication",
+    "NVDA": "Technology",
+    "TSLA": "Consumer",
+}
 
 load_dotenv(ENV_PATH, override=False)
 
@@ -564,6 +626,67 @@ def sync_binance_crypto_bars(
     return combined
 
 
+def sync_yfinance_stock_bars(
+    symbol: str,
+    timeframe: str,
+    events: queue.Queue | None = None,
+) -> pd.DataFrame:
+    if yf is None:
+        raise UserFacingError(
+            "Stock history needs MASSIVE_API_KEY or the yfinance package. Run setup.bat."
+        )
+    symbol = symbol.upper()
+    cached = read_cached_bars(symbol, timeframe)
+    now = datetime.now(timezone.utc)
+    history_days = 7 if timeframe == "1Min" else STOCK_DAILY_HISTORY_DAYS
+    start = (
+        cached["timestamp"].iloc[-1].to_pydatetime()
+        if not cached.empty
+        else now - timedelta(days=history_days)
+    )
+    downloaded = yf.download(
+        symbol,
+        start=start.date().isoformat(),
+        end=(now + timedelta(days=1)).date().isoformat(),
+        interval="1m" if timeframe == "1Min" else "1d",
+        auto_adjust=True,
+        progress=False,
+        threads=False,
+    )
+    if downloaded.empty:
+        if cached.empty:
+            raise UserFacingError(f"Yahoo Finance returned no bars for {symbol}.")
+        return cached
+    if isinstance(downloaded.columns, pd.MultiIndex):
+        downloaded.columns = downloaded.columns.get_level_values(0)
+    downloaded = downloaded.reset_index().rename(
+        columns={
+            "Date": "timestamp",
+            "Datetime": "timestamp",
+            "Open": "open",
+            "High": "high",
+            "Low": "low",
+            "Close": "close",
+            "Volume": "volume",
+        }
+    )
+    downloaded["symbol"] = symbol
+    fetched = normalise_bar_frame(downloaded, symbol)
+    combined = merge_bar_frames(symbol, cached, fetched)
+    path = write_cached_bars(combined, symbol, timeframe)
+    if events is not None:
+        events.put(
+            {
+                "kind": "log",
+                "text": (
+                    f"YAHOO  | {symbol} {timeframe} fetched={len(fetched)} "
+                    f"cached={len(combined)} file={path.name}"
+                ),
+            }
+        )
+    return combined
+
+
 def sync_training_bars(
     asset_class: str,
     symbol: str,
@@ -572,7 +695,9 @@ def sync_training_bars(
     force_refresh: bool = False,
 ) -> pd.DataFrame:
     if asset_class == "stocks":
-        return sync_massive_stock_bars(symbol, timeframe, events, force_refresh)
+        if os.getenv("MASSIVE_API_KEY") or os.getenv("POLYGON_API_KEY"):
+            return sync_massive_stock_bars(symbol, timeframe, events, force_refresh)
+        return sync_yfinance_stock_bars(symbol, timeframe, events)
     if asset_class == "crypto":
         return sync_binance_crypto_bars(symbol, timeframe, events, force_refresh)
     raise UserFacingError(f"Unsupported asset class: {asset_class}")
@@ -633,21 +758,74 @@ def engineer_features(
     bars["volume_change"] = volume.pct_change().clip(-10, 10)
     bars["range_pct"] = (high - low) / close
     bars["body_pct"] = (close - open_price) / open_price.replace(0, np.nan)
+    bars["sma_5_gap"] = close / close.rolling(5).mean() - 1.0
     bars["sma_10_gap"] = close / close.rolling(10).mean() - 1.0
     bars["sma_30_gap"] = close / close.rolling(30).mean() - 1.0
+    bars["momentum_5"] = close.pct_change(5)
+    bars["momentum_20"] = close.pct_change(20)
+    bars["volume_ratio_5_20"] = (
+        volume.rolling(5).mean() / volume.rolling(20).mean().replace(0, np.nan)
+    )
+    bars["sharpe_20"] = (
+        bars["log_return"].rolling(20).mean()
+        / bars["log_return"].rolling(20).std().replace(0, np.nan)
+        * np.sqrt(20)
+    )
 
     if include_target:
-        bars["future_return"] = close.shift(-FORWARD_HORIZON) / close - 1.0
+        future_returns = pd.concat(
+            [close.shift(-step) / close - 1.0 for step in range(1, FORWARD_HORIZON + 1)],
+            axis=1,
+        )
+        bars["future_max_return"] = future_returns.max(axis=1)
         bars["target"] = np.select(
             [
-                bars["future_return"] > move_threshold,
-                bars["future_return"] < -move_threshold,
+                bars["future_max_return"] > move_threshold,
+                bars["future_max_return"] < -move_threshold,
             ],
             [1, 2],
             default=0,
         ).astype(float)
-        bars.loc[bars["future_return"].isna(), "target"] = np.nan
+        bars.loc[bars.index[-FORWARD_HORIZON:], "target"] = np.nan
     return bars.replace([np.inf, -np.inf], np.nan)
+
+
+def model_feature_vector(
+    featured: pd.DataFrame, end: int, sentiment: float = 0.0
+) -> np.ndarray | None:
+    start = end - LOOKBACK + 1
+    if start < 0:
+        return None
+    window = featured.iloc[start : end + 1]
+    returns = window["log_return"]
+    volume_change = window["volume_change"]
+    last = window.iloc[-1]
+    values = np.asarray(
+        [
+            last["log_return"],
+            returns.tail(5).mean(),
+            returns.tail(10).mean(),
+            returns.mean(),
+            returns.tail(5).std(),
+            returns.tail(20).std(),
+            last["sma_5_gap"],
+            last["sma_10_gap"],
+            last["sma_30_gap"],
+            last["rsi_14"],
+            last["macd_hist_pct"],
+            last["atr_14_pct"],
+            volume_change.tail(5).mean(),
+            last["volume_ratio_5_20"],
+            last["range_pct"],
+            last["body_pct"],
+            last["momentum_5"],
+            last["momentum_20"],
+            last["sharpe_20"],
+            float(np.clip(sentiment, -1.0, 1.0)),
+        ],
+        dtype=np.float32,
+    )
+    return values if np.isfinite(values).all() else None
 
 
 @dataclass
@@ -669,20 +847,21 @@ def symbol_windows(
     featured = engineer_features(
         frame, include_target=True, move_threshold=move_threshold
     )
-    featured = featured.dropna(subset=FEATURE_COLUMNS).reset_index(drop=True)
-    values = featured[FEATURE_COLUMNS].to_numpy(dtype=np.float32)
+    featured = featured.reset_index(drop=True)
     targets = featured["target"].to_numpy()
     windows: list[np.ndarray] = []
     labels: list[int] = []
     for end in range(LOOKBACK - 1, len(featured)):
         if np.isnan(targets[end]):
             continue
-        start = end - LOOKBACK + 1
-        windows.append(values[start : end + 1].reshape(-1))
+        vector = model_feature_vector(featured, end)
+        if vector is None:
+            continue
+        windows.append(vector)
         labels.append(int(targets[end]))
     if not windows:
         return (
-            np.empty((0, LOOKBACK * len(FEATURE_COLUMNS)), dtype=np.float32),
+            np.empty((0, len(MODEL_FEATURES)), dtype=np.float32),
             np.empty((0,), dtype=np.int64),
         )
     return np.stack(windows).astype(np.float32), np.asarray(labels, dtype=np.int64)
@@ -754,18 +933,877 @@ class ShallowTradeNet(nn.Module):
 
 
 def latest_model_input(
-    frame: pd.DataFrame, mean: np.ndarray, std: np.ndarray
+    frame: pd.DataFrame,
+    mean: np.ndarray,
+    std: np.ndarray,
+    sentiment: float = 0.0,
 ) -> tuple[np.ndarray, pd.Timestamp, float]:
     featured = engineer_features(frame, include_target=False)
-    featured = featured.dropna(subset=FEATURE_COLUMNS).reset_index(drop=True)
-    if len(featured) < LOOKBACK:
+    featured = featured.reset_index(drop=True)
+    vector = model_feature_vector(featured, len(featured) - 1, sentiment)
+    if vector is None:
         raise UserFacingError(
-            f"Need {LOOKBACK} valid feature rows; only {len(featured)} are available."
+            f"Need {LOOKBACK} complete feature rows; only {len(featured)} bars are available."
         )
-    window = featured[FEATURE_COLUMNS].tail(LOOKBACK).to_numpy(dtype=np.float32).reshape(-1)
-    scaled = ((window - mean) / std).astype(np.float32)
+    scaled = ((vector - mean) / std).astype(np.float32)
     last = featured.iloc[-1]
     return scaled, pd.Timestamp(last["timestamp"]), float(last["close"])
+
+
+# ---------------------------------------------------------------------------
+# SQLite message bus
+# ---------------------------------------------------------------------------
+
+
+class AgentDatabase:
+    def __init__(self, path: Path = DB_PATH) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._initialize()
+
+    def connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, timeout=10.0)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("PRAGMA busy_timeout=10000")
+        return connection
+
+    def _initialize(self) -> None:
+        schema = """
+        CREATE TABLE IF NOT EXISTS live_prices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            asset_type TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL,
+            close REAL NOT NULL, volume REAL NOT NULL,
+            UNIQUE(symbol, timestamp)
+        );
+        CREATE INDEX IF NOT EXISTS idx_live_symbol_time
+            ON live_prices(symbol, timestamp DESC);
+        CREATE TABLE IF NOT EXISTS research_findings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            headline TEXT NOT NULL,
+            source TEXT NOT NULL,
+            label TEXT NOT NULL,
+            sentiment REAL NOT NULL,
+            UNIQUE(symbol, headline)
+        );
+        CREATE TABLE IF NOT EXISTS asset_rankings (
+            symbol TEXT PRIMARY KEY,
+            asset_type TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            score REAL NOT NULL,
+            momentum_z REAL NOT NULL,
+            vol_ratio_z REAL NOT NULL,
+            adx REAL NOT NULL,
+            atr_pct REAL NOT NULL,
+            sentiment REAL NOT NULL,
+            sharpe_60_z REAL NOT NULL,
+            last_price REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS investment_decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            asset_type TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            signal TEXT NOT NULL,
+            probability REAL NOT NULL,
+            price REAL NOT NULL,
+            atr REAL NOT NULL,
+            stop_loss REAL NOT NULL,
+            take_profit REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            note TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_decision_status
+            ON investment_decisions(status, timestamp);
+        CREATE TABLE IF NOT EXISTS portfolio_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            action TEXT NOT NULL,
+            quantity REAL NOT NULL,
+            price REAL NOT NULL,
+            equity REAL NOT NULL,
+            pnl REAL NOT NULL,
+            order_id TEXT NOT NULL DEFAULT '',
+            note TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS training_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            epoch INTEGER NOT NULL,
+            train_loss REAL NOT NULL,
+            validation_loss REAL NOT NULL,
+            validation_accuracy REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS agent_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            agent TEXT NOT NULL,
+            level TEXT NOT NULL,
+            message TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS universe_assets (
+            symbol TEXT PRIMARY KEY,
+            asset_type TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
+        );
+        """
+        with self.connect() as connection:
+            connection.executescript(schema)
+
+    def execute(self, sql: str, parameters: tuple = ()) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(sql, parameters)
+            return int(cursor.lastrowid or 0)
+
+    def executemany(self, sql: str, rows: list[tuple]) -> None:
+        if not rows:
+            return
+        with self.connect() as connection:
+            connection.executemany(sql, rows)
+
+    def query(self, sql: str, parameters: tuple = ()) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return list(connection.execute(sql, parameters).fetchall())
+
+    def log(self, agent: str, message: str, level: str = "INFO") -> None:
+        self.execute(
+            "INSERT INTO agent_logs(timestamp, agent, level, message) VALUES(?,?,?,?)",
+            (datetime.now(timezone.utc).isoformat(), agent, level, message),
+        )
+
+    def latest_sentiment(self, symbol: str) -> float:
+        rows = self.query(
+            "SELECT sentiment FROM research_findings WHERE symbol=? "
+            "ORDER BY timestamp DESC LIMIT 10",
+            (symbol,),
+        )
+        return float(np.mean([row["sentiment"] for row in rows])) if rows else 0.0
+
+
+class WatchlistState:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.stocks = DEFAULT_SYMBOLS.copy()
+        self.crypto = DEFAULT_CRYPTO_SYMBOLS.copy()
+
+    def snapshot(self) -> tuple[list[str], list[str]]:
+        with self.lock:
+            return self.stocks.copy(), self.crypto.copy()
+
+    def set_primary(self, symbols: list[str], asset_class: str) -> None:
+        with self.lock:
+            if asset_class == "stocks":
+                self.stocks = symbols.copy()
+            else:
+                self.crypto = [item.replace("/", "").replace("-", "") for item in symbols]
+
+
+class BaseAgent(threading.Thread):
+    def __init__(
+        self,
+        name: str,
+        database: AgentDatabase,
+        events: queue.Queue,
+        stop_event: threading.Event,
+    ) -> None:
+        super().__init__(name=name, daemon=True)
+        self.agent_name = name
+        self.database = database
+        self.events = events
+        self.stop_event = stop_event
+
+    def log(self, message: str, level: str = "INFO") -> None:
+        self.database.log(self.agent_name, message, level)
+        self.events.put(
+            {"kind": "log", "text": f"{self.agent_name.upper():8s}| {message}"}
+        )
+
+
+# ---------------------------------------------------------------------------
+# Researcher agent: live prices, news, and lazy local FinBERT
+# ---------------------------------------------------------------------------
+
+
+class FinBERTSentiment:
+    def __init__(self) -> None:
+        self.tokenizer = None
+        self.model = None
+        self.failed_reason: str | None = None
+        self.lock = threading.Lock()
+
+    def _load(self) -> bool:
+        with self.lock:
+            if self.model is not None:
+                return True
+            if self.failed_reason is not None:
+                return False
+            if AutoTokenizer is None or AutoModelForSequenceClassification is None:
+                self.failed_reason = "transformers is not installed"
+                return False
+            try:
+                FINBERT_DIR.mkdir(parents=True, exist_ok=True)
+                has_cache = any(
+                    FINBERT_DIR.glob("models--ProsusAI--finbert/snapshots/*")
+                )
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    "ProsusAI/finbert",
+                    cache_dir=FINBERT_DIR,
+                    local_files_only=has_cache,
+                )
+                self.model = AutoModelForSequenceClassification.from_pretrained(
+                    "ProsusAI/finbert",
+                    cache_dir=FINBERT_DIR,
+                    local_files_only=has_cache,
+                ).to("cpu")
+                self.model.eval()
+                return True
+            except Exception as exc:
+                self.failed_reason = str(exc)
+                return False
+
+    @staticmethod
+    def _lexical(text: str) -> tuple[str, float]:
+        lowered = text.lower()
+        positive = sum(
+            word in lowered
+            for word in ("beat", "growth", "gain", "surge", "profit", "upgrade")
+        )
+        negative = sum(
+            word in lowered
+            for word in ("miss", "loss", "drop", "fall", "risk", "downgrade")
+        )
+        score = float(np.clip((positive - negative) / 3.0, -1.0, 1.0))
+        return ("positive" if score > 0 else "negative" if score < 0 else "neutral", score)
+
+    def score(self, text: str) -> tuple[str, float]:
+        if not self._load():
+            return self._lexical(text)
+        assert self.tokenizer is not None and self.model is not None
+        encoded = self.tokenizer(
+            text, return_tensors="pt", truncation=True, padding=True, max_length=128
+        )
+        with torch.inference_mode():
+            probabilities = torch.softmax(self.model(**encoded).logits, dim=1)[0]
+        labels = {
+            int(index): str(label).lower()
+            for index, label in self.model.config.id2label.items()
+        }
+        best = int(probabilities.argmax().item())
+        probability_by_label = {
+            labels[index]: float(probabilities[index].item()) for index in labels
+        }
+        signed = probability_by_label.get("positive", 0.0) - probability_by_label.get(
+            "negative", 0.0
+        )
+        return labels.get(best, "neutral"), float(signed)
+
+
+class ResearcherAgent(BaseAgent):
+    def __init__(self, database, events, stop_event, watchlist: WatchlistState) -> None:
+        super().__init__("researcher", database, events, stop_event)
+        self.watchlist = watchlist
+        self.sentiment = FinBERTSentiment()
+        self.stock_client = None
+        self.missing_stock_credentials_logged = False
+        self.invalid_crypto_symbols: set[str] = set()
+
+    def run(self) -> None:
+        next_prices = 0.0
+        next_news = time.monotonic() + 30.0
+        self.log("agent online")
+        while not self.stop_event.is_set():
+            now = time.monotonic()
+            try:
+                if now >= next_prices:
+                    self.fetch_prices()
+                    next_prices = now + RESEARCH_PRICE_SECONDS
+                if now >= next_news:
+                    self.fetch_news()
+                    next_news = now + RESEARCH_NEWS_SECONDS
+            except Exception as exc:
+                self.log(str(exc), "ERROR")
+            self.stop_event.wait(0.2)
+        self.log("agent stopped")
+
+    def _store_bar(self, symbol: str, asset_type: str, bar) -> None:
+        timestamp = pd.Timestamp(getattr(bar, "timestamp", datetime.now(timezone.utc)))
+        self.database.execute(
+            "INSERT OR REPLACE INTO live_prices"
+            "(symbol,asset_type,timestamp,open,high,low,close,volume) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                symbol,
+                asset_type,
+                timestamp.isoformat(),
+                float(bar.open),
+                float(bar.high),
+                float(bar.low),
+                float(bar.close),
+                float(bar.volume),
+            ),
+        )
+
+    def fetch_prices(self) -> None:
+        stocks, crypto_symbols = self.watchlist.snapshot()
+        try:
+            if self.stock_client is None:
+                key, secret = api_credentials()
+                self.stock_client = StockHistoricalDataClient(key, secret)
+            request = StockLatestBarRequest(symbol_or_symbols=stocks, feed=DataFeed.IEX)
+            bars = self.stock_client.get_stock_latest_bar(request)
+            for symbol, bar in bars.items():
+                self._store_bar(symbol, "stock", bar)
+        except UserFacingError:
+            if not self.missing_stock_credentials_logged:
+                self.log("Alpaca keys missing; stock stream paused, crypto remains active", "WARN")
+                self.missing_stock_credentials_logged = True
+        if requests is None:
+            return
+        for symbol in crypto_symbols[:5]:
+            if symbol in self.invalid_crypto_symbols:
+                continue
+            try:
+                response = requests.get(
+                    "https://api.binance.com/api/v3/klines",
+                    params={"symbol": symbol, "interval": "1m", "limit": 1},
+                    timeout=10,
+                )
+                response.raise_for_status()
+                item = response.json()[0]
+                self.database.execute(
+                    "INSERT OR REPLACE INTO live_prices"
+                    "(symbol,asset_type,timestamp,open,high,low,close,volume) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        symbol,
+                        "crypto",
+                        pd.to_datetime(item[0], unit="ms", utc=True).isoformat(),
+                        float(item[1]),
+                        float(item[2]),
+                        float(item[3]),
+                        float(item[4]),
+                        float(item[5]),
+                    ),
+                )
+            except Exception as exc:
+                self.invalid_crypto_symbols.add(symbol)
+                self.log(f"crypto symbol disabled {symbol}: {exc}", "WARN")
+
+    def fetch_news(self) -> None:
+        stocks, _ = self.watchlist.snapshot()
+        headlines: list[tuple[str, str, str]] = []
+        finnhub_key = os.getenv("FINNHUB_API_KEY")
+        if finnhub_key and finnhub is not None:
+            client = finnhub.Client(api_key=finnhub_key)
+            today = datetime.now(timezone.utc).date()
+            for symbol in stocks:
+                for item in client.company_news(
+                    symbol,
+                    _from=(today - timedelta(days=1)).isoformat(),
+                    to=today.isoformat(),
+                )[:10]:
+                    headline = str(item.get("headline", "")).strip()
+                    if headline:
+                        headlines.append((symbol, headline, "Finnhub"))
+        else:
+            for symbol in stocks:
+                url = (
+                    "https://feeds.finance.yahoo.com/rss/2.0/headline?"
+                    + urllib.parse.urlencode({"s": symbol, "region": "US", "lang": "en-US"})
+                )
+                content = http_get_bytes(url, context=f"Yahoo RSS {symbol}", missing_ok=True)
+                if not content:
+                    continue
+                root = ET.fromstring(content)
+                for item in root.findall(".//item")[:10]:
+                    headline = (item.findtext("title") or "").strip()
+                    if headline:
+                        headlines.append((symbol, headline, "Yahoo RSS"))
+        for symbol, headline, source in headlines:
+            label, sentiment = self.sentiment.score(headline)
+            self.database.execute(
+                "INSERT OR IGNORE INTO research_findings"
+                "(symbol,timestamp,headline,source,label,sentiment) VALUES(?,?,?,?,?,?)",
+                (
+                    symbol,
+                    datetime.now(timezone.utc).isoformat(),
+                    headline,
+                    source,
+                    label,
+                    sentiment,
+                ),
+            )
+        if headlines:
+            self.log(f"news processed={len(headlines)} model={'FinBERT' if self.sentiment.model is not None else 'lexical fallback'}")
+
+
+# ---------------------------------------------------------------------------
+# Analyst agent: indicators and ranked composite scores
+# ---------------------------------------------------------------------------
+
+
+class AnalystAgent(BaseAgent):
+    def __init__(self, database, events, stop_event, watchlist: WatchlistState) -> None:
+        super().__init__("analyst", database, events, stop_event)
+        self.watchlist = watchlist
+
+    def run(self) -> None:
+        next_analysis = 0.0
+        next_universe = time.monotonic() + 30.0
+        self.log("agent online")
+        while not self.stop_event.is_set():
+            now = time.monotonic()
+            try:
+                if now >= next_analysis:
+                    self.rank_assets()
+                    next_analysis = now + ANALYST_SECONDS
+                if now >= next_universe:
+                    self.refresh_universe()
+                    next_universe = now + UNIVERSE_SECONDS
+            except Exception as exc:
+                self.log(str(exc), "ERROR")
+            self.stop_event.wait(1.0)
+        self.log("agent stopped")
+
+    def _symbol_frame(self, symbol: str) -> tuple[pd.DataFrame, str] | None:
+        rows = self.database.query(
+            "SELECT * FROM live_prices WHERE symbol=? ORDER BY timestamp DESC LIMIT 500",
+            (symbol,),
+        )
+        if len(rows) < 35:
+            return None
+        frame = pd.DataFrame([dict(row) for row in reversed(rows)])
+        if pl is not None:
+            frame = pl.from_pandas(frame).sort("timestamp").to_pandas()
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
+        return frame, str(rows[0]["asset_type"])
+
+    def rank_assets(self) -> None:
+        stocks, crypto_symbols = self.watchlist.snapshot()
+        raw: list[dict] = []
+        for symbol in stocks + crypto_symbols:
+            result = self._symbol_frame(symbol)
+            if result is None:
+                continue
+            frame, asset_type = result
+            featured = engineer_features(frame, include_target=False).dropna()
+            if featured.empty:
+                continue
+            last = featured.iloc[-1]
+            high, low, close = frame["high"], frame["low"], frame["close"]
+            adx = float(ADXIndicator(high, low, close, window=14).adx().iloc[-1])
+            raw.append(
+                {
+                    "symbol": symbol,
+                    "asset_type": asset_type,
+                    "momentum": float(last["momentum_20"]),
+                    "vol_ratio": float(last["volume_ratio_5_20"]),
+                    "adx": adx,
+                    "atr_pct": float(last["atr_14_pct"]),
+                    "sentiment": self.database.latest_sentiment(symbol),
+                    "sharpe": float(last["sharpe_20"]),
+                    "last_price": float(last["close"]),
+                }
+            )
+        if not raw:
+            return
+        table = pd.DataFrame(raw)
+        for source, target in (
+            ("momentum", "momentum_z"),
+            ("vol_ratio", "vol_ratio_z"),
+            ("atr_pct", "atr_pct_z"),
+            ("sharpe", "sharpe_60_z"),
+        ):
+            std = float(table[source].std(ddof=0))
+            table[target] = (table[source] - table[source].mean()) / (std or 1.0)
+        sigmoid = lambda values: 1.0 / (1.0 + np.exp(-values))
+        table["score"] = 100.0 * (
+            0.25 * sigmoid(table["momentum_z"])
+            + 0.15 * sigmoid(table["vol_ratio_z"])
+            + 0.10 * np.clip(table["adx"] / 50.0, 0.0, 1.0)
+            + 0.10 * sigmoid(-table["atr_pct_z"])
+            + 0.15 * ((np.clip(table["sentiment"], -1, 1) + 1.0) / 2.0)
+            + 0.25 * sigmoid(table["sharpe_60_z"])
+        )
+        top = table.sort_values("score", ascending=False).head(10)
+        with self.database.connect() as connection:
+            connection.execute("DELETE FROM asset_rankings")
+            connection.executemany(
+                "INSERT INTO asset_rankings VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                [
+                    (
+                        row.symbol,
+                        row.asset_type,
+                        datetime.now(timezone.utc).isoformat(),
+                        float(row.score),
+                        float(row.momentum_z),
+                        float(row.vol_ratio_z),
+                        float(row.adx),
+                        float(row.atr_pct),
+                        float(row.sentiment),
+                        float(row.sharpe_60_z),
+                        float(row.last_price),
+                    )
+                    for row in top.itertuples()
+                ],
+            )
+        self.events.put({"kind": "rankings", "rows": top.to_dict("records")})
+        self.log(f"ranked assets={len(top)} leader={top.iloc[0]['symbol']}")
+
+    def refresh_universe(self) -> None:
+        rows: list[tuple[str, str, str, str]] = []
+        timestamp = datetime.now(timezone.utc).isoformat()
+        try:
+            wikipedia_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+            if requests is None:
+                sp500 = pd.read_html(wikipedia_url)[0]
+            else:
+                response = requests.get(
+                    wikipedia_url,
+                    headers={"User-Agent": "Mozilla/5.0 KorvaxTradeMind/1.0"},
+                    timeout=20,
+                )
+                response.raise_for_status()
+                sp500 = pd.read_html(io.StringIO(response.text))[0]
+            rows.extend(
+                (str(row.Symbol).replace(".", "-"), "stock", str(row.Security), timestamp)
+                for row in sp500.itertuples()
+            )
+        except Exception as exc:
+            self.log(f"S&P 500 universe refresh skipped: {exc}", "WARN")
+        if requests is not None:
+            try:
+                response = requests.get(
+                    "https://api.coingecko.com/api/v3/coins/markets",
+                    params={
+                        "vs_currency": "usd",
+                        "order": "market_cap_desc",
+                        "per_page": 100,
+                        "page": 1,
+                    },
+                    timeout=20,
+                )
+                response.raise_for_status()
+                coins = response.json()
+                tradable_coins = [
+                    item
+                    for item in coins
+                    if str(item.get("symbol", "")).lower()
+                    not in {"usdt", "usdc", "dai", "usde", "fdusd", "tusd"}
+                ]
+                rows.extend(
+                    (
+                        f"{str(item['symbol']).upper()}USDT",
+                        "crypto",
+                        str(item["name"]),
+                        timestamp,
+                    )
+                    for item in tradable_coins
+                )
+                top_five = [
+                    f"{str(item['symbol']).upper()}USDT" for item in tradable_coins[:5]
+                ]
+                with self.watchlist.lock:
+                    self.watchlist.crypto = top_five
+            except Exception as exc:
+                self.log(f"CoinGecko universe refresh skipped: {exc}", "WARN")
+        self.database.executemany(
+            "INSERT OR REPLACE INTO universe_assets(symbol,asset_type,name,updated_at) VALUES(?,?,?,?)",
+            rows,
+        )
+        if rows:
+            self.log(f"universe refreshed assets={len(rows)}")
+
+
+# ---------------------------------------------------------------------------
+# Investor agent: model inference and ATR-derived decisions
+# ---------------------------------------------------------------------------
+
+
+class InvestorAgent(BaseAgent):
+    def __init__(self, database, events, stop_event) -> None:
+        super().__init__("investor", database, events, stop_event)
+        self.checkpoint = None
+        self.model = None
+        self.last_decision: dict[str, float] = {}
+
+    def _load_model(self) -> None:
+        checkpoint = torch.load(MODEL_PATH, map_location="cpu", weights_only=False)
+        model = ShallowTradeNet(int(checkpoint["input_size"]))
+        model.load_state_dict(checkpoint["state_dict"])
+        model.eval()
+        self.checkpoint = checkpoint
+        self.model = model
+
+    def run(self) -> None:
+        self.log("agent online")
+        while not self.stop_event.is_set():
+            try:
+                if self.model is None:
+                    self._load_model()
+                    self.log("trade model loaded")
+                self.evaluate_rankings()
+            except FileNotFoundError:
+                self.log("model missing; waiting for training", "WARN")
+            except Exception as exc:
+                self.log(str(exc), "ERROR")
+            self.stop_event.wait(INVESTOR_SECONDS)
+        self.log("agent stopped")
+
+    def evaluate_rankings(self) -> None:
+        assert self.checkpoint is not None and self.model is not None
+        rankings = self.database.query(
+            "SELECT * FROM asset_rankings ORDER BY score DESC LIMIT 3"
+        )
+        mean = np.asarray(self.checkpoint["mean"], dtype=np.float32)
+        std = np.asarray(self.checkpoint["std"], dtype=np.float32)
+        for ranking in rankings:
+            symbol = str(ranking["symbol"])
+            rows = self.database.query(
+                "SELECT * FROM live_prices WHERE symbol=? ORDER BY timestamp DESC LIMIT 120",
+                (symbol,),
+            )
+            if len(rows) < LOOKBACK + 5:
+                continue
+            frame = pd.DataFrame([dict(row) for row in reversed(rows)])
+            frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
+            model_input, timestamp, price = latest_model_input(
+                frame, mean, std, float(ranking["sentiment"])
+            )
+            with torch.inference_mode():
+                probabilities = torch.softmax(
+                    self.model(torch.from_numpy(model_input).unsqueeze(0)), dim=1
+                )[0]
+            signal = int(probabilities.argmax().item())
+            probability = float(probabilities[signal].item())
+            if signal == 0 or probability < 0.45:
+                continue
+            now = time.monotonic()
+            if now - self.last_decision.get(symbol, 0.0) < 60:
+                continue
+            featured = engineer_features(frame, include_target=False).dropna()
+            atr = float(featured.iloc[-1]["atr_14_pct"] * price)
+            stop = price - 2 * atr if signal == 1 else price + 2 * atr
+            target = price + 3 * atr if signal == 1 else price - 3 * atr
+            self.database.execute(
+                "INSERT INTO investment_decisions"
+                "(symbol,asset_type,timestamp,signal,probability,price,atr,stop_loss,take_profit,status) "
+                "VALUES(?,?,?,?,?,?,?,?,?,'pending')",
+                (
+                    symbol,
+                    ranking["asset_type"],
+                    timestamp.isoformat(),
+                    SIGNAL_NAMES[signal],
+                    probability,
+                    price,
+                    atr,
+                    stop,
+                    target,
+                ),
+            )
+            self.last_decision[symbol] = now
+            self.log(f"{symbol} {SIGNAL_NAMES[signal]} probability={probability:.1%}")
+
+
+# ---------------------------------------------------------------------------
+# Cashier agent: paper-only execution and portfolio risk controls
+# ---------------------------------------------------------------------------
+
+
+class CashierAgent(BaseAgent):
+    def __init__(self, database, events, stop_event) -> None:
+        super().__init__("cashier", database, events, stop_event)
+        self.client = None
+        self.start_equity = 0.0
+        self.peak_equity = 0.0
+        self.halted = False
+
+    @staticmethod
+    def alpaca_symbol(symbol: str, asset_type: str) -> str:
+        if asset_type == "crypto" and symbol.endswith("USDT"):
+            return f"{symbol[:-4]}/USD"
+        return symbol
+
+    def run(self) -> None:
+        self.log("agent online; endpoint=paper")
+        try:
+            key, secret = api_credentials()
+            self.client = TradingClient(key, secret, paper=True)
+            account = self.client.get_account()
+            self.start_equity = self.peak_equity = float(account.equity)
+        except Exception as exc:
+            self.log(f"paper connection failed: {exc}", "ERROR")
+            self.events.put(
+                {
+                    "kind": "paper_error",
+                    "context": "Paper trading",
+                    "text": str(exc),
+                }
+            )
+            return
+        while not self.stop_event.is_set():
+            try:
+                self.process_pending()
+                self.monitor_risk()
+            except Exception as exc:
+                self.log(str(exc), "ERROR")
+            self.stop_event.wait(CASHIER_SECONDS)
+        self.log("agent stopped")
+        self.events.put({"kind": "paper_done", "text": "CASHIER | paper execution stopped"})
+
+    def _risk_allows(self, decision: sqlite3.Row, equity: float) -> tuple[bool, str]:
+        if self.halted:
+            return False, "risk halt active"
+        if equity <= self.start_equity * (1.0 - MAX_DAILY_LOSS):
+            self.halted = True
+            return False, "maximum daily loss reached"
+        if equity <= self.peak_equity * (1.0 - MAX_GLOBAL_DRAWDOWN):
+            self.halted = True
+            return False, "global drawdown limit reached"
+        sector = SECTOR_MAP.get(str(decision["symbol"]), "Crypto" if decision["asset_type"] == "crypto" else "Other")
+        positions = self.client.get_all_positions()
+        same_sector = sum(
+            1
+            for position in positions
+            if SECTOR_MAP.get(str(position.symbol), "Other") == sector
+        )
+        if same_sector >= 2:
+            return False, f"sector position limit reached: {sector}"
+        return True, "approved"
+
+    def process_pending(self) -> None:
+        assert self.client is not None
+        account = self.client.get_account()
+        equity = float(account.equity)
+        self.peak_equity = max(self.peak_equity, equity)
+        decisions = self.database.query(
+            "SELECT * FROM investment_decisions WHERE status='pending' ORDER BY id LIMIT 10"
+        )
+        for decision in decisions:
+            allowed, note = self._risk_allows(decision, equity)
+            if not allowed:
+                self.database.execute(
+                    "UPDATE investment_decisions SET status='rejected', note=? WHERE id=?",
+                    (note, decision["id"]),
+                )
+                self.log(f"{decision['symbol']} rejected: {note}", "WARN")
+                continue
+            symbol = self.alpaca_symbol(str(decision["symbol"]), str(decision["asset_type"]))
+            atr = max(float(decision["atr"]), float(decision["price"]) * 0.001)
+            risk_quantity = (equity * RISK_PER_TRADE) / (2.0 * atr)
+            cap_quantity = (equity * MAX_ASSET_ALLOCATION) / float(decision["price"])
+            quantity = max(0.0001, min(risk_quantity, cap_quantity))
+            signal = str(decision["signal"])
+            if signal == "SELL":
+                try:
+                    order = self.client.close_position(symbol)
+                    quantity = 0.0
+                except APIError as exc:
+                    self.database.execute(
+                        "UPDATE investment_decisions SET status='rejected', note=? WHERE id=?",
+                        (f"no long position: {exc}", decision["id"]),
+                    )
+                    continue
+            else:
+                request = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=quantity,
+                    side=OrderSide.BUY,
+                    time_in_force=(
+                        TimeInForce.GTC if decision["asset_type"] == "crypto" else TimeInForce.DAY
+                    ),
+                    client_order_id=f"korvax-{decision['id']}-{int(time.time())}",
+                )
+                order = self.client.submit_order(order_data=request)
+            order_id = str(getattr(order, "id", ""))
+            self.database.execute(
+                "UPDATE investment_decisions SET status='submitted', note=? WHERE id=?",
+                (order_id, decision["id"]),
+            )
+            pnl = equity - self.start_equity
+            self.database.execute(
+                "INSERT INTO portfolio_log(timestamp,symbol,action,quantity,price,equity,pnl,order_id,note) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    symbol,
+                    signal,
+                    quantity,
+                    float(decision["price"]),
+                    equity,
+                    pnl,
+                    order_id,
+                    "paper",
+                ),
+            )
+            self.events.put(
+                {
+                    "kind": "paper_row",
+                    "values": (
+                        datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        symbol,
+                        signal,
+                        f"{float(decision['probability']):.1%}",
+                        f"{float(decision['price']):.2f}",
+                        f"{quantity:.6g}",
+                        f"{equity:.2f}",
+                        f"{pnl:+.2f}",
+                        "SUBMITTED",
+                    ),
+                }
+            )
+            self.log(f"paper {signal} submitted {symbol} qty={quantity:.6g}")
+
+    def monitor_risk(self) -> None:
+        assert self.client is not None
+        account = self.client.get_account()
+        equity = float(account.equity)
+        self.peak_equity = max(self.peak_equity, equity)
+        if equity <= self.peak_equity * (1.0 - MAX_GLOBAL_DRAWDOWN):
+            self.halted = True
+            self.log("20% drawdown reached; new orders halted", "ERROR")
+        decisions = self.database.query(
+            "SELECT * FROM investment_decisions WHERE status='submitted' AND signal='BUY'"
+        )
+        for decision in decisions:
+            latest = self.database.query(
+                "SELECT close FROM live_prices WHERE symbol=? ORDER BY timestamp DESC LIMIT 1",
+                (decision["symbol"],),
+            )
+            if not latest:
+                continue
+            price = float(latest[0]["close"])
+            stop = float(decision["stop_loss"])
+            entry = float(decision["price"])
+            atr = float(decision["atr"])
+            if price >= entry + atr and stop < entry:
+                stop = entry
+                self.database.execute(
+                    "UPDATE investment_decisions SET stop_loss=?, note='stop moved to breakeven' WHERE id=?",
+                    (stop, decision["id"]),
+                )
+                self.log(f"{decision['symbol']} stop moved to breakeven")
+            if price <= stop or price >= float(decision["take_profit"]):
+                symbol = self.alpaca_symbol(
+                    str(decision["symbol"]), str(decision["asset_type"])
+                )
+                try:
+                    self.client.close_position(symbol)
+                    reason = "stop" if price <= stop else "target"
+                    self.database.execute(
+                        "UPDATE investment_decisions SET status='closed', note=? WHERE id=?",
+                        (reason, decision["id"]),
+                    )
+                    self.log(f"{symbol} exited at {reason} price={price:.4g}")
+                except APIError as exc:
+                    self.log(f"{symbol} exit check: {exc}", "WARN")
 
 
 class SymbolDialog(tk.Toplevel):
@@ -880,10 +1918,10 @@ class SymbolDialog(tk.Toplevel):
 
 
 class NetworkSimulation:
-    def __init__(self, app: "AlpacaTradeMindApp") -> None:
+    def __init__(self, app: "MainApp") -> None:
         self.app = app
         self.window = tk.Toplevel(app.root)
-        self.window.title("Alpaca TradeMind / Network Trace")
+        self.window.title("Korvax TradeMind / Network Trace")
         self.window.configure(bg=BLACK)
         self.window.geometry("930x520")
         self.window.minsize(760, 430)
@@ -919,8 +1957,8 @@ class NetworkSimulation:
         small = ("Consolas", 8)
 
         input_x = width * 0.10
-        input_labels = ["PRICE", "RETURNS", "VOLATILITY", "MOMENTUM", "VOLUME"]
-        input_y = [height * value for value in (0.20, 0.32, 0.44, 0.56, 0.68)]
+        input_labels = [f"F{i:02d}" for i in range(1, 13)]
+        input_y = np.linspace(height * 0.13, height * 0.77, 12).tolist()
         self.input_centres = list(zip([input_x] * len(input_y), input_y))
         self.hidden_one = (width * 0.32, height * 0.22, width * 0.45, height * 0.68)
         self.hidden_two = (width * 0.56, height * 0.30, width * 0.68, height * 0.60)
@@ -957,7 +1995,7 @@ class NetworkSimulation:
                 x - 14, y, anchor="e", text=label, fill=TEXT, font=small
             )
 
-        self._draw_hidden_box(self.hidden_one, "DENSE 01", "300 INPUTS  ->  32", font, small)
+        self._draw_hidden_box(self.hidden_one, "DENSE 01", "20 FEATURES  ->  32", font, small)
         self._draw_hidden_box(self.hidden_two, "DENSE 02", "32  ->  16", font, small)
         self.output_nodes.clear()
         for class_id in (1, 2, 0):
@@ -976,7 +2014,7 @@ class NetworkSimulation:
             )
 
         self.canvas.create_text(
-            20, 15, anchor="w", text="FEATURE GROUPS / 30-BAR WINDOW", fill=ACCENT, font=small
+            20, 15, anchor="w", text="12 VISIBLE NODES / 20 MODEL FEATURES", fill=ACCENT, font=small
         )
         self.canvas.create_text(
             width - 20,
@@ -1085,16 +2123,23 @@ class NetworkSimulation:
                 pass
 
 
-class AlpacaTradeMindApp:
+class MainApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("TradeMind Trainer / Free Data + Alpaca Paper")
+        self.root.title("Korvax TradeMind / Multi-Agent Paper Console")
         self.root.configure(bg=BG)
         self.root.geometry("1280x760")
         self.root.minsize(1040, 620)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
         self.events: queue.Queue = queue.Queue()
+        self.database = AgentDatabase()
+        self.watchlist = WatchlistState()
+        self.core_agent_stop = threading.Event()
+        self.cashier_stop = threading.Event()
+        self.agent_threads: list[BaseAgent] = []
+        self.cashier_agent: CashierAgent | None = None
         has_massive_key = bool(
             os.getenv("MASSIVE_API_KEY") or os.getenv("POLYGON_API_KEY")
         )
@@ -1103,7 +2148,8 @@ class AlpacaTradeMindApp:
         )
         self.timeframe = DEFAULT_TIMEFRAME
         self.asset_class = DEFAULT_ASSET_CLASS if has_massive_key else "crypto"
-        self.logs: deque[str] = deque(maxlen=18)
+        self.watchlist.set_primary(self.symbols, self.asset_class)
+        self.logs: deque[str] = deque(maxlen=200)
         self.busy = False
         self.training = False
         self.paper_running = False
@@ -1126,9 +2172,12 @@ class AlpacaTradeMindApp:
         self.latest_validation_loss: float | None = None
         self.latest_accuracy: float | None = None
         self.latest_class_counts = {0: 0, 1: 0, 2: 0}
+        self.paper_equity_points: list[float] = []
 
         self._build_style()
         self._build_ui()
+        self._seed_database_from_cache()
+        self._start_core_agents()
         data_state = "present" if self._massive_credentials_present() else "missing"
         paper_state = "present" if self._credentials_present() else "missing"
         self._log(
@@ -1138,6 +2187,60 @@ class AlpacaTradeMindApp:
         self.root.after(100, self._poll_events)
         self.root.after(1000, self._update_clock)
         self.root.after(2000, self._redraw_chart)
+
+    def _seed_database_from_cache(self) -> None:
+        candidates = [(symbol, "stock") for symbol in DEFAULT_SYMBOLS]
+        candidates.extend((symbol, "crypto") for symbol in DEFAULT_CRYPTO_SYMBOLS)
+        candidates.extend(
+            (symbol, "stock" if self.asset_class == "stocks" else "crypto")
+            for symbol in self.symbols
+        )
+        inserted = 0
+        for symbol, asset_type in dict.fromkeys(candidates):
+            for timeframe in (self.timeframe, "1Day", "1Min"):
+                try:
+                    frame = read_cached_bars(symbol, timeframe).tail(500)
+                except Exception:
+                    continue
+                if frame.empty:
+                    continue
+                rows = [
+                    (
+                        symbol,
+                        asset_type,
+                        pd.Timestamp(row.timestamp).isoformat(),
+                        float(row.open),
+                        float(row.high),
+                        float(row.low),
+                        float(row.close),
+                        float(row.volume),
+                    )
+                    for row in frame.itertuples()
+                ]
+                self.database.executemany(
+                    "INSERT OR REPLACE INTO live_prices"
+                    "(symbol,asset_type,timestamp,open,high,low,close,volume) VALUES(?,?,?,?,?,?,?,?)",
+                    rows,
+                )
+                inserted += len(rows)
+                break
+        if inserted:
+            self._log(f"DATABASE| seeded historical bars={inserted}")
+
+    def _start_core_agents(self) -> None:
+        if self.agent_threads:
+            return
+        self.agent_threads = [
+            ResearcherAgent(
+                self.database, self.events, self.core_agent_stop, self.watchlist
+            ),
+            AnalystAgent(
+                self.database, self.events, self.core_agent_stop, self.watchlist
+            ),
+            InvestorAgent(self.database, self.events, self.core_agent_stop),
+        ]
+        for agent in self.agent_threads:
+            agent.start()
 
     @staticmethod
     def _credentials_present() -> bool:
@@ -1251,7 +2354,7 @@ class AlpacaTradeMindApp:
         top = ttk.Frame(self.root)
         top.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(5, 3))
         top.grid_columnconfigure(0, weight=1)
-        ttk.Label(top, text="TRADEMIND TRAINER", style="Title.TLabel").grid(
+        ttk.Label(top, text="KORVAX TRADEMIND", style="Title.TLabel").grid(
             row=0, column=0, sticky="w"
         )
         self.status_var = tk.StringVar(value="STATE  IDLE")
@@ -1304,13 +2407,18 @@ class AlpacaTradeMindApp:
         self.notebook.grid(row=0, column=0, sticky="nsew")
 
         training_tab = ttk.Frame(self.notebook)
+        rankings_tab = ttk.Frame(self.notebook)
         paper_tab = ttk.Frame(self.notebook)
         self.notebook.add(training_tab, text="TRAINING")
+        self.notebook.add(rankings_tab, text="RANKINGS")
         self.notebook.add(paper_tab, text="PAPER P&L")
         training_tab.grid_rowconfigure(0, weight=1)
         training_tab.grid_columnconfigure(0, weight=1)
         paper_tab.grid_rowconfigure(0, weight=1)
+        paper_tab.grid_rowconfigure(1, weight=2)
         paper_tab.grid_columnconfigure(0, weight=1)
+        rankings_tab.grid_rowconfigure(0, weight=1)
+        rankings_tab.grid_columnconfigure(0, weight=1)
 
         self.figure = Figure(figsize=(7.4, 5.2), dpi=100, facecolor=BG)
         self.loss_axes = self.figure.add_subplot(211)
@@ -1335,6 +2443,18 @@ class AlpacaTradeMindApp:
             row=2, column=0, sticky="ew"
         )
 
+        ranking_columns = ("rank", "symbol", "type", "score", "price", "sentiment", "adx")
+        self.rankings_table = ttk.Treeview(
+            rankings_tab,
+            columns=ranking_columns,
+            show="headings",
+            style="Trade.Treeview",
+        )
+        for column, width in zip(ranking_columns, (55, 90, 75, 85, 110, 95, 80)):
+            self.rankings_table.heading(column, text=column.upper())
+            self.rankings_table.column(column, width=width, anchor="center", stretch=True)
+        self.rankings_table.grid(row=0, column=0, sticky="nsew")
+
         paper_columns = (
             "time",
             "symbol",
@@ -1346,6 +2466,16 @@ class AlpacaTradeMindApp:
             "pnl",
             "action",
         )
+        self.paper_figure = Figure(figsize=(7.4, 1.8), dpi=100, facecolor=BG)
+        self.paper_axes = self.paper_figure.add_subplot(111)
+        self.paper_axes.set_facecolor(BG)
+        self.paper_axes.set_title("PAPER EQUITY", color=TEXT, fontsize=8)
+        self.paper_axes.tick_params(colors=TEXT, labelsize=7)
+        for spine in self.paper_axes.spines.values():
+            spine.set_color(ACCENT)
+        self.paper_chart = FigureCanvasTkAgg(self.paper_figure, master=paper_tab)
+        self.paper_chart.get_tk_widget().configure(bg=BG, highlightthickness=0)
+        self.paper_chart.get_tk_widget().grid(row=0, column=0, sticky="nsew")
         self.paper_table = ttk.Treeview(
             paper_tab,
             columns=paper_columns,
@@ -1356,11 +2486,11 @@ class AlpacaTradeMindApp:
         for column, width in zip(paper_columns, widths):
             self.paper_table.heading(column, text=column.upper())
             self.paper_table.column(column, width=width, anchor="center", stretch=True)
-        self.paper_table.grid(row=0, column=0, sticky="nsew")
+        self.paper_table.grid(row=1, column=0, sticky="nsew")
         paper_scroll = ttk.Scrollbar(
             paper_tab, orient="vertical", command=self.paper_table.yview
         )
-        paper_scroll.grid(row=0, column=1, sticky="ns")
+        paper_scroll.grid(row=1, column=1, sticky="ns")
         self.paper_table.configure(yscrollcommand=paper_scroll.set)
 
         bottom = ttk.LabelFrame(
@@ -1389,6 +2519,7 @@ class AlpacaTradeMindApp:
         self.paper_button = self._button(
             bottom, "Start Paper Trading", self.toggle_paper_trading
         )
+        self.reset_button = self._button(bottom, "Reset Model", self.reset_model)
 
     def _button(self, parent, text: str, command, state: str = "normal") -> ttk.Button:
         button = ttk.Button(
@@ -1420,7 +2551,7 @@ class AlpacaTradeMindApp:
                 pass
         if self.asset_class == "stocks":
             data_source = (
-                "MASSIVE READY" if self._massive_credentials_present() else "MASSIVE KEY MISSING"
+                "MASSIVE READY" if self._massive_credentials_present() else "YAHOO FALLBACK"
             )
         else:
             data_source = "BINANCE PUBLIC"
@@ -1430,12 +2561,16 @@ class AlpacaTradeMindApp:
         self.meta_var.set(
             f"ASSET {self.asset_class.upper()}  |  SYMBOLS {','.join(self.symbols)}  |  BARS {self.timeframe}  |  "
             f"CACHE {cache_rows} ROWS  |  WINDOW {LOOKBACK}  |  HORIZON {FORWARD_HORIZON}  |  "
-            f"THRESHOLD {threshold:.2%}  |  NETWORK {LOOKBACK * len(FEATURE_COLUMNS)}-32-16-3  |  "
+            f"THRESHOLD {threshold:.2%}  |  NETWORK {len(MODEL_FEATURES)}-32-16-3  |  "
             f"DATA {data_source}  |  MODEL {model}  |  ALPACA PAPER {paper_credentials}"
         )
 
     def _log(self, message: str) -> None:
         self.logs.append(f"{time.strftime('%H:%M:%S')}  {message}")
+        try:
+            self.database.log("monitor", message)
+        except Exception:
+            pass
         self.log_box.delete(0, tk.END)
         for line in self.logs:
             self.log_box.insert(tk.END, line)
@@ -1447,6 +2582,7 @@ class AlpacaTradeMindApp:
         self.symbol_button.configure(state=normal)
         self.download_button.configure(state=normal)
         self.train_button.configure(state=normal)
+        self.reset_button.configure(state=normal)
         self.stop_button.configure(state="normal" if self.training else "disabled")
         if self.paper_running:
             self.paper_button.configure(state="normal")
@@ -1454,6 +2590,26 @@ class AlpacaTradeMindApp:
             self.paper_button.configure(state="disabled")
         else:
             self.paper_button.configure(state="normal")
+
+    def reset_model(self) -> None:
+        if self.training or self.paper_running:
+            return
+        if not MODEL_PATH.exists():
+            self._log("MODEL   | no checkpoint to reset")
+            return
+        if not messagebox.askyesno(
+            "Reset model",
+            "Delete the trained trade model and start over?",
+            parent=self.root,
+        ):
+            return
+        MODEL_PATH.unlink(missing_ok=True)
+        for agent in self.agent_threads:
+            if isinstance(agent, InvestorAgent):
+                agent.model = None
+                agent.checkpoint = None
+        self._refresh_meta()
+        self._log("MODEL   | checkpoint reset")
 
     def load_symbols(self) -> None:
         if self.busy or self.paper_running:
@@ -1465,6 +2621,7 @@ class AlpacaTradeMindApp:
         if dialog.result is None:
             return
         self.symbols, self.timeframe, self.asset_class = dialog.result
+        self.watchlist.set_primary(self.symbols, self.asset_class)
         self._refresh_meta()
         self._log(
             f"UNIVERSE | asset={self.asset_class}  symbols={','.join(self.symbols)}  "
@@ -1475,12 +2632,6 @@ class AlpacaTradeMindApp:
         if self.busy:
             return
         self.train_after_download = False
-        if self.asset_class == "stocks":
-            try:
-                massive_api_key()
-            except UserFacingError as exc:
-                messagebox.showerror("Massive API key", str(exc), parent=self.root)
-                return
         self.status_var.set("STATE  DOWNLOADING")
         self._set_controls(True)
         self.operation_thread = threading.Thread(
@@ -1525,12 +2676,6 @@ class AlpacaTradeMindApp:
             if read_cached_bars(symbol, self.timeframe).empty
         ]
         if missing:
-            if self.asset_class == "stocks":
-                try:
-                    massive_api_key()
-                except UserFacingError as exc:
-                    messagebox.showerror("Massive API key", str(exc), parent=self.root)
-                    return
             self.train_after_download = True
             self.status_var.set("STATE  DOWNLOADING FOR TRAINING")
             self._set_controls(True)
@@ -1577,6 +2722,7 @@ class AlpacaTradeMindApp:
     def _training_worker(self) -> None:
         try:
             torch.set_num_threads(CPU_THREADS)
+            run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
             move_threshold = training_move_threshold(
                 self.asset_class, self.timeframe
             )
@@ -1701,6 +2847,19 @@ class AlpacaTradeMindApp:
                         "accuracy": accuracy,
                     }
                 )
+                self.database.execute(
+                    "INSERT INTO training_log"
+                    "(run_id,timestamp,epoch,train_loss,validation_loss,validation_accuracy) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (
+                        run_id,
+                        datetime.now(timezone.utc).isoformat(),
+                        epoch,
+                        train_loss,
+                        val_loss,
+                        accuracy,
+                    ),
+                )
                 if val_loss < best_validation_loss - 1e-4:
                     best_validation_loss = val_loss
                     best_epoch = epoch
@@ -1741,6 +2900,7 @@ class AlpacaTradeMindApp:
                 "best_validation_loss": best_validation_loss,
                 "saved_at": datetime.now(timezone.utc).isoformat(),
             }
+            MODEL_DIR.mkdir(parents=True, exist_ok=True)
             torch.save(checkpoint, MODEL_PATH)
             stopped = self.stop_training_event.is_set()
             self.events.put(
@@ -1764,23 +2924,17 @@ class AlpacaTradeMindApp:
 
     def toggle_paper_trading(self) -> None:
         if self.paper_running:
-            self.stop_paper_event.set()
+            self.cashier_stop.set()
             self.paper_button.configure(state="disabled")
-            self._log("PAPER  | stop requested")
+            self._log("CASHIER | paper stop requested")
             return
         if self.busy or self.training:
             return
-        if self.asset_class != "stocks":
-            messagebox.showerror(
-                "Stock paper trading only",
-                "This safety-tested paper execution loop currently supports US stocks only. "
-                "Crypto data can be downloaded and trained, but crypto orders are disabled.",
-                parent=self.root,
-            )
-            return
         if not MODEL_PATH.exists():
             messagebox.showerror(
-                "Model required", "Train and save trade_model.pt first.", parent=self.root
+                "Model required",
+                "Train and save models/trade_model.pt first.",
+                parent=self.root,
             )
             return
         try:
@@ -1790,23 +2944,23 @@ class AlpacaTradeMindApp:
             return
         confirmed = messagebox.askyesno(
             "Start paper trading",
-            "This starts a PAPER-ONLY loop and may submit simulated market orders.\n\n"
-            f"Symbol: {self.symbols[0]}\nQuantity: {PAPER_QUANTITY:g} share\n"
-            f"Polling: {PAPER_POLL_SECONDS} seconds\n\nContinue?",
+            "This enables the Investor -> Cashier pipeline and may submit simulated "
+            "stock or crypto orders to Alpaca's PAPER endpoint.\n\n"
+            "Risk limits: 1% equity risk/trade, 2% daily loss, 20% drawdown.\n\nContinue?",
             parent=self.root,
         )
         if not confirmed:
             return
-        self.stop_paper_event.clear()
+        self.cashier_stop.clear()
         self.paper_running = True
-        self.status_var.set("STATE  PAPER TRADING")
+        self.status_var.set("STATE  MULTI-AGENT PAPER")
         self._set_controls(True)
         self.paper_button.configure(text="Stop Paper Trading", state="normal")
-        self.notebook.select(1)
-        self.paper_thread = threading.Thread(
-            target=self._paper_worker, name="alpaca-paper", daemon=True
+        self.notebook.select(2)
+        self.cashier_agent = CashierAgent(
+            self.database, self.events, self.cashier_stop
         )
-        self.paper_thread.start()
+        self.cashier_agent.start()
 
     def _position_or_none(self, client: TradingClient, symbol: str):
         try:
@@ -1982,6 +3136,7 @@ class AlpacaTradeMindApp:
                     self.status_var.set(f"STATE  {event['status']}")
                     self._set_controls(False)
                     self._log(event["text"])
+                    self._seed_database_from_cache()
                     self._refresh_meta()
                     if event.get("start_training"):
                         self.train_after_download = False
@@ -2023,13 +3178,36 @@ class AlpacaTradeMindApp:
                     self._set_controls(False)
                     self._log(event["text"])
                     self._refresh_meta()
+                elif kind == "rankings":
+                    for item in self.rankings_table.get_children():
+                        self.rankings_table.delete(item)
+                    for rank, row in enumerate(event["rows"], start=1):
+                        self.rankings_table.insert(
+                            "",
+                            "end",
+                            values=(
+                                rank,
+                                row["symbol"],
+                                row["asset_type"],
+                                f"{float(row['score']):.1f}",
+                                f"{float(row['last_price']):.4g}",
+                                f"{float(row['sentiment']):+.2f}",
+                                f"{float(row['adx']):.1f}",
+                            ),
+                        )
                 elif kind == "paper_row":
                     self.paper_table.insert("", 0, values=event["values"])
+                    try:
+                        self.paper_equity_points.append(float(event["values"][6]))
+                        self.paper_equity_points = self.paper_equity_points[-250:]
+                    except (TypeError, ValueError):
+                        pass
                     children = self.paper_table.get_children()
                     if len(children) > 250:
                         self.paper_table.delete(children[-1])
                 elif kind == "paper_done":
                     self.paper_running = False
+                    self.cashier_agent = None
                     self.status_var.set("STATE  IDLE")
                     self.paper_button.configure(text="Start Paper Trading")
                     self._set_controls(False)
@@ -2107,6 +3285,32 @@ class AlpacaTradeMindApp:
                 family="monospace",
             )
         self.chart.draw_idle()
+        self.paper_axes.clear()
+        self.paper_axes.set_facecolor(BG)
+        self.paper_axes.set_title("PAPER EQUITY", color=TEXT, fontsize=8)
+        self.paper_axes.tick_params(colors=TEXT, labelsize=7)
+        for spine in self.paper_axes.spines.values():
+            spine.set_color(ACCENT)
+        if self.paper_equity_points:
+            self.paper_axes.plot(
+                range(1, len(self.paper_equity_points) + 1),
+                self.paper_equity_points,
+                color=WHITE,
+                linewidth=0.9,
+            )
+        else:
+            self.paper_axes.text(
+                0.5,
+                0.5,
+                "NO PAPER FILLS",
+                transform=self.paper_axes.transAxes,
+                ha="center",
+                va="center",
+                color=ACCENT,
+                fontsize=8,
+                family="monospace",
+            )
+        self.paper_chart.draw_idle()
         if self.root.winfo_exists():
             self.root.after(2000, self._redraw_chart)
 
@@ -2152,8 +3356,8 @@ class AlpacaTradeMindApp:
     def close(self) -> None:
         if self.training:
             self.stop_training_event.set()
-        if self.paper_running:
-            self.stop_paper_event.set()
+        self.core_agent_stop.set()
+        self.cashier_stop.set()
         self.root.destroy()
 
 
@@ -2167,7 +3371,7 @@ def main() -> None:
             pass
     torch.set_num_threads(CPU_THREADS)
     root = tk.Tk()
-    AlpacaTradeMindApp(root)
+    MainApp(root)
     root.mainloop()
 
 

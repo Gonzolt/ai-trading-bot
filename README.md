@@ -1,59 +1,49 @@
-# TradeMind Trainer
+# Korvax TradeMind
 
-A single-file Windows desktop application that downloads free Massive US-stock bars or free Binance crypto bars, builds leakage-safe market-feature windows, trains a shallow PyTorch classifier on CPU, and can execute US-stock signals against Alpaca's paper-money endpoint.
+Korvax TradeMind is a single-file, CPU-only Windows desktop application for market research, neural-network training, and Alpaca paper execution. It coordinates four daemon agents through a local SQLite database while Tkinter remains on the main UI thread.
 
-This is research software, not investment advice. The model is intentionally simple and paper trading is permanently enabled in the source. It cannot connect to Alpaca's live-money endpoint.
+This is research software, not investment advice. Alpaca is always created with `paper=True`; no live-money endpoint exists in the application.
+
+## Architecture
+
+- **Researcher** polls Alpaca IEX stock bars and keyless Binance crypto bars, gathers Finnhub or Yahoo RSS news, and scores headlines with a lazily downloaded local `ProsusAI/finbert` model.
+- **Analyst** uses Polars/Pandas and `ta` to calculate RSI, MACD, ATR, ADX, momentum, volume ratio and rolling Sharpe. It publishes a weighted 0–100 ranking for the top ten assets.
+- **Investor** loads the local 20→32→16→3 PyTorch model, evaluates the top three assets, and records ATR-derived decisions.
+- **Cashier** is started only after explicit confirmation. It submits paper orders while enforcing 1% equity risk per trade, a 25% per-asset cap, a 2% daily-loss halt, sector concentration limits, and a 20% global drawdown halt.
+- **Monitor** is the Tkinter UI, live charts, logs, rankings, P&L table, and animated network trace.
+
+Agents communicate through `trademind.db` in SQLite WAL mode using `live_prices`, `research_findings`, `asset_rankings`, `investment_decisions`, `portfolio_log`, `training_log`, and `agent_logs` tables.
 
 ## Setup
 
 1. Install 64-bit Python 3.11.
 2. Run `setup.bat`.
-3. Copy `.env.example` to `.env`.
-4. Add a free Massive Stocks Basic key as `MASSIVE_API_KEY` for stock downloads.
-5. Add Alpaca paper-account values only if paper execution is needed.
-6. Run `run.bat`.
+3. Optionally copy `.env.example` to `.env` and enter keys locally.
+4. Run `run.bat`.
 
-Binance crypto downloads need no key. Alpaca credentials do not block downloads or training; they are only checked before paper execution. Recent free IEX bars are overlaid in memory for stock paper decisions and are never written into the Massive training cache.
+API keys are never committed:
+
+- `MASSIVE_API_KEY`: optional free Massive Stocks Basic key for historical stock training data.
+- `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY`: required for Alpaca stock streaming and paper execution.
+- `FINNHUB_API_KEY`: optional; Yahoo Finance RSS is the news fallback.
+
+Binance public crypto downloads require no key. If no Massive key exists, the app starts with `BTCUSDT`, `ETHUSDT`, and `SOLUSDT`.
 
 ## Workflow
 
-1. **Load Symbols** selects `stocks` (Massive) or `crypto` (Binance), comma-separated symbols, and daily or one-minute bars. Use symbols such as `AAPL` or `BTCUSDT`.
-2. **Download Data** incrementally synchronizes OHLCV bars into `market_cache/`. Existing Parquet or CSV data is reused.
-3. **Start Training** engineers indicators, creates chronological windows and trains the CPU network.
-4. **Open Simulation** shows actual batch-majority labels moving through the 300→32→16→3 topology.
-5. **Start Paper Trading** requires an Alpaca stock-paper account, explicit confirmation, and a stock-trained model. Crypto order submission is intentionally disabled pending a separate crypto execution safety pass.
+1. Use **Load Symbols** to select stocks or crypto and daily or one-minute bars.
+2. Select **Download Data**. Historical bars are cached in `market_cache/` as Parquet or CSV.
+3. Select **Start Training**. Missing data is downloaded automatically.
+4. Watch training/validation loss and accuracy or open the animated network trace.
+5. Inspect live scores in **Rankings**.
+6. Add Alpaca paper keys and select **Start Paper Trading** to enable the Investor→Cashier pipeline.
 
-When no Massive key is configured, the app starts in keyless crypto mode with `BTCUSDT`, `ETHUSDT`, and `SOLUSDT`. With a Massive key present, it starts in stock mode with `AAPL`, `MSFT`, and `GOOGL`. Both providers request roughly two years of daily data or 90 days of minute data. Downloads are cached in Parquet with CSV fallback.
+## Model and data safety
 
-## Dataset and model
+Each sample uses a 30-bar lookback summarized into 20 explainable features: return horizons and volatility, SMA gaps, RSI, MACD, ATR, volume change/ratio, candle range/body, momentum, rolling Sharpe, and sentiment. The network is `20 → 32 → 16 → 3` for hold, buy, and sell.
 
-Each sample contains the prior 30 bars of ten features:
+Every symbol is split chronologically before concatenation. Scaler statistics are fitted only on training windows. Training uses class-weighted cross entropy, gradient clipping, validation-based early stopping, and saves the best checkpoint to `models/trade_model.pt`. Training metrics are also written to SQLite.
 
-- log return
-- 20-bar volatility
-- normalized 14-bar ATR
-- normalized 14-bar RSI
-- normalized MACD histogram
-- volume change
-- high-low range
-- open-close body
-- distance from 10-bar SMA
-- distance from 30-bar SMA
+FinBERT is downloaded only when news is first processed and is cached under `models/finbert/`. If transformers or the model service is unavailable, the Researcher records a warning and uses a small deterministic lexical fallback instead of stopping the other agents.
 
-The target uses the close five bars after the sample endpoint. The threshold is scaled to the market and timeframe: 0.2% for one-minute data, 0.5% for daily stocks, and 2% for daily crypto.
-
-- `BUY (1)` when the future return is above the configured positive threshold
-- `SELL (2)` when it is below the negative threshold
-- `HOLD (0)` otherwise
-
-Windows never contain future bars. Every symbol is split chronologically before concatenation, and normalization statistics are fitted only on training windows. The model is an explainable multilayer perceptron: 300 inputs, 32 hidden units, 16 hidden units, and three logits. Training stops after five validation epochs without improvement and `trade_model.pt` contains the best validation checkpoint rather than the final overfit epoch.
-
-## Paper execution
-
-Paper mode polls once per minute and uses the first selected symbol. It checks Alpaca's market clock, computes the latest feature window, and performs long-only actions:
-
-- BUY with no position: submit a one-share paper market order.
-- SELL with a position: submit a paper market order for the held quantity.
-- HOLD: no order.
-
-The paper-account tab records signal confidence, price, position, account equity, session P&L and the submitted action. API calls retry transient rate-limit and server failures with exponential backoff.
+Generated caches, SQLite files, models, logs, `.env`, and the virtual environment are excluded from Git.

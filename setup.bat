@@ -25,5 +25,5 @@ python -m pip install -r requirements.txt
 if errorlevel 1 exit /b 1
 
 echo.
-echo Setup complete. Run run.bat to launch TradeMind Trainer.
+echo Setup complete. Run run.bat to launch Korvax TradeMind.
 endlocal

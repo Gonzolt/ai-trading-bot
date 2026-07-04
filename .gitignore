@@ -17,8 +17,10 @@ finbert_model/
 finbert_trained/
 .trademind_checkpoints/
 
-# Alpaca TradeMind runtime data and credentials
+# Korvax TradeMind runtime data and credentials
 .env
 market_cache/
 trade_model.pt
+models/
+trademind.db*
 runtime/
