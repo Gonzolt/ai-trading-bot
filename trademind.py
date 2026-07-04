@@ -95,15 +95,15 @@ FORWARD_HORIZON = 5
 MOVE_THRESHOLD = 0.002  # 0.2%
 STOCK_DAILY_MOVE_THRESHOLD = 0.005
 CRYPTO_DAILY_MOVE_THRESHOLD = 0.02
-EPOCHS = 20
 BATCH_SIZE = 128
 LEARNING_RATE = 1e-3
 CPU_THREADS = 20
 PAPER_QUANTITY = 1.0
 PAPER_POLL_SECONDS = 60
 VALIDATION_FRACTION = 0.20
-EARLY_STOPPING_PATIENCE = 5
 MIN_EPOCH_DISPLAY_SECONDS = 0.65
+AUTOSAVE_EPOCHS = 10
+MAX_CHART_EPOCHS = 500
 RESEARCH_PRICE_SECONDS = 1
 RESEARCH_NEWS_SECONDS = 5 * 60
 ANALYST_SECONDS = 60
@@ -2329,6 +2329,7 @@ class MainApp:
         self.busy = False
         self.training = False
         self.paper_running = False
+        self.closing = False
         self.stop_training_event = threading.Event()
         self.stop_paper_event = threading.Event()
         self.operation_thread: threading.Thread | None = None
@@ -2338,6 +2339,7 @@ class MainApp:
         self.train_losses: list[float] = []
         self.validation_losses: list[float] = []
         self.validation_accuracies: list[float] = []
+        self.training_epoch_numbers: list[int] = []
         self.current_epoch = 0
         self.current_batch = 0
         self.batches_per_epoch = 0
@@ -2931,6 +2933,7 @@ class MainApp:
         self.train_losses.clear()
         self.validation_losses.clear()
         self.validation_accuracies.clear()
+        self.training_epoch_numbers.clear()
         self.current_epoch = 0
         self.current_batch = 0
         self.batches_per_epoch = 0
@@ -2949,7 +2952,7 @@ class MainApp:
         self.status_var.set("STATE  TRAINING / INITIALIZING")
         self._log(
             f"TRAIN  | started asset={training_asset_class} timeframe={training_timeframe} "
-            f"symbols={','.join(training_symbols)}"
+            f"symbols={','.join(training_symbols)} mode=continuous_until_manual_stop"
         )
         self.progress_var.set(0.0)
         self._set_controls(True)
@@ -3040,10 +3043,34 @@ class MainApp:
             best_epoch = 0
             best_validation_loss = float("inf")
             best_state: dict[str, torch.Tensor] | None = None
-            stale_epochs = 0
-            for epoch in range(1, EPOCHS + 1):
-                if self.stop_training_event.is_set():
-                    break
+
+            def checkpoint_payload(
+                state_dict: dict[str, torch.Tensor], epochs_completed: int
+            ) -> dict:
+                return {
+                    "state_dict": state_dict,
+                    "input_size": bundle.x_train.shape[1],
+                    "mean": bundle.mean,
+                    "std": bundle.std,
+                    "feature_columns": FEATURE_COLUMNS,
+                    "lookback": LOOKBACK,
+                    "forward_horizon": FORWARD_HORIZON,
+                    "move_threshold": move_threshold,
+                    "symbols": list(symbols),
+                    "asset_class": asset_class,
+                    "training_source": (
+                        "Massive/Yahoo" if asset_class == "stocks" else "Binance Public"
+                    ),
+                    "timeframe": timeframe,
+                    "epochs_completed": epochs_completed,
+                    "best_epoch": best_epoch,
+                    "best_validation_loss": best_validation_loss,
+                    "saved_at": datetime.now(timezone.utc).isoformat(),
+                }
+
+            epoch = 0
+            while not self.stop_training_event.is_set():
+                epoch += 1
                 epoch_started_at = time.monotonic()
                 model.train()
                 running_loss = 0.0
@@ -3124,20 +3151,19 @@ class MainApp:
                     best_validation_loss = val_loss
                     best_epoch = epoch
                     best_state = copy.deepcopy(model.state_dict())
-                    stale_epochs = 0
-                else:
-                    stale_epochs += 1
-                    if stale_epochs >= EARLY_STOPPING_PATIENCE:
-                        self.events.put(
-                            {
-                                "kind": "log",
-                                "text": (
-                                    f"EARLY STOP (NORMAL) | validation did not improve for "
-                                    f"{EARLY_STOPPING_PATIENCE} epochs; restoring best_epoch={best_epoch}"
-                                ),
-                            }
-                        )
-                        break
+                if epoch % AUTOSAVE_EPOCHS == 0 and best_state is not None:
+                    save_checkpoint_atomic(
+                        checkpoint_payload(best_state, completed_epochs), MODEL_PATH
+                    )
+                    self.events.put(
+                        {
+                            "kind": "log",
+                            "text": (
+                                f"AUTOSAVE | epoch={epoch} best_epoch={best_epoch} "
+                                f"val={best_validation_loss:.5f}"
+                            ),
+                        }
+                    )
 
             if best_state is not None:
                 model.load_state_dict(best_state)
@@ -3154,26 +3180,7 @@ class MainApp:
                 )
                 return
 
-            checkpoint = {
-                "state_dict": model.state_dict(),
-                "input_size": bundle.x_train.shape[1],
-                "mean": bundle.mean,
-                "std": bundle.std,
-                "feature_columns": FEATURE_COLUMNS,
-                "lookback": LOOKBACK,
-                "forward_horizon": FORWARD_HORIZON,
-                "move_threshold": move_threshold,
-                "symbols": list(symbols),
-                "asset_class": asset_class,
-                "training_source": (
-                    "Massive/Yahoo" if asset_class == "stocks" else "Binance Public"
-                ),
-                "timeframe": timeframe,
-                "epochs_completed": completed_epochs,
-                "best_epoch": best_epoch,
-                "best_validation_loss": best_validation_loss,
-                "saved_at": datetime.now(timezone.utc).isoformat(),
-            }
+            checkpoint = checkpoint_payload(model.state_dict(), completed_epochs)
             save_checkpoint_atomic(checkpoint, MODEL_PATH)
             stopped = self.stop_training_event.is_set()
             self.events.put(
@@ -3421,7 +3428,7 @@ class MainApp:
                 elif kind == "training_setup":
                     self.status_var.set("STATE  TRAINING")
                     self.training_phase = (
-                        "STATE TRAINING  |  LIVE FORWARD PASSES  |  "
+                        "STATE TRAINING CONTINUOUSLY  |  PRESS STOP TO FINISH  |  "
                         f"{event['train_rows']} TRAIN / {event['validation_rows']} VALIDATION"
                     )
                     self.latest_class_counts = dict(event["class_counts"])
@@ -3438,9 +3445,7 @@ class MainApp:
                     self.latest_train_loss = float(event["loss"])
                     self.elapsed_seconds = float(event["elapsed"])
                     epoch_fraction = self.current_batch / max(self.batches_per_epoch, 1)
-                    self.progress_var.set(
-                        100.0 * ((self.current_epoch - 1) + epoch_fraction) / EPOCHS
-                    )
+                    self.progress_var.set(100.0 * epoch_fraction)
                     if self.current_batch in (1, self.batches_per_epoch):
                         self._log(
                             f"BATCH  | epoch={self.current_epoch:02d}  "
@@ -3449,14 +3454,23 @@ class MainApp:
                             f"class={SIGNAL_NAMES[self.current_batch_label]}"
                         )
                 elif kind == "epoch_metrics":
+                    self.training_epoch_numbers.append(int(event["epoch"]))
                     self.train_losses.append(float(event["train_loss"]))
                     self.validation_losses.append(float(event["validation_loss"]))
                     self.validation_accuracies.append(float(event["accuracy"]))
+                    self.training_epoch_numbers = self.training_epoch_numbers[
+                        -MAX_CHART_EPOCHS:
+                    ]
+                    self.train_losses = self.train_losses[-MAX_CHART_EPOCHS:]
+                    self.validation_losses = self.validation_losses[-MAX_CHART_EPOCHS:]
+                    self.validation_accuracies = self.validation_accuracies[
+                        -MAX_CHART_EPOCHS:
+                    ]
                     self.latest_train_loss = self.train_losses[-1]
                     self.latest_validation_loss = self.validation_losses[-1]
                     self.latest_accuracy = self.validation_accuracies[-1]
                     self._log(
-                        f"EPOCH  | {event['epoch']:02d}/{EPOCHS:02d}  "
+                        f"EPOCH  | {event['epoch']:04d}/CONTINUOUS  "
                         f"train={self.latest_train_loss:.5f}  "
                         f"val={self.latest_validation_loss:.5f}  "
                         f"accuracy={self.latest_accuracy:.2%}"
@@ -3464,8 +3478,14 @@ class MainApp:
                 elif kind == "training_done":
                     self.training = False
                     if event["stopped"]:
-                        self.status_var.set("STATE  TRAINING STOPPED")
-                        self.training_phase = "STATE STOPPED  |  TRAINING CANCELLED"
+                        saved_epoch = event.get("best_epoch", "--")
+                        self.status_var.set(
+                            f"STATE  MODEL SAVED / STOPPED / BEST EPOCH {saved_epoch}"
+                        )
+                        self.training_phase = (
+                            "STATE COMPLETE  |  STOPPED BY USER  |  "
+                            f"BEST EPOCH {saved_epoch}"
+                        )
                     else:
                         self.progress_var.set(100.0)
                         self.status_var.set(
@@ -3479,7 +3499,7 @@ class MainApp:
                     self._log(event["text"])
                     if not event["stopped"]:
                         self._log(
-                            "TRAIN  | COMPLETE; early stopping is normal and the best checkpoint is active"
+                            "TRAIN  | COMPLETE; the best checkpoint is active"
                         )
                     if self.simulation_window is not None:
                         self.simulation_window.mark_complete()
@@ -3544,7 +3564,7 @@ class MainApp:
         self.loss_axes.clear()
         self.accuracy_axes.clear()
         self._style_axes()
-        epochs = list(range(1, len(self.train_losses) + 1))
+        epochs = self.training_epoch_numbers
         if epochs:
             self.loss_axes.plot(
                 epochs, self.train_losses, color=WHITE, linewidth=0.9, label="train"
@@ -3640,17 +3660,10 @@ class MainApp:
     def _refresh_telemetry(self) -> None:
         if self.training and self.started_at:
             self.elapsed_seconds = time.monotonic() - self.started_at
-        total_batches = EPOCHS * self.batches_per_epoch
-        completed = 0
-        if self.current_epoch and self.batches_per_epoch:
-            completed = (self.current_epoch - 1) * self.batches_per_epoch + self.current_batch
-        eta = None
-        if self.training and completed > 0 and total_batches > completed:
-            eta = self.elapsed_seconds / completed * (total_batches - completed)
         self.telemetry_var.set(
-            f"EPOCH {self.current_epoch:02d}/{EPOCHS:02d}  |  "
+            f"EPOCH {self.current_epoch:04d}/CONT  |  "
             f"BATCH {self.current_batch:04d}/{self.batches_per_epoch:04d}  |  "
-            f"ELAPSED {self._duration(self.elapsed_seconds)}  |  ETA {self._duration(eta)}\n"
+            f"ELAPSED {self._duration(self.elapsed_seconds)}  |  END MANUAL STOP\n"
             f"TRAIN LOSS {self._metric(self.latest_train_loss)}  |  "
             f"VAL LOSS {self._metric(self.latest_validation_loss)}  |  "
             f"VAL ACC {self._metric(self.latest_accuracy, 3)}  |  "
@@ -3665,10 +3678,21 @@ class MainApp:
             self.root.after(1000, self._update_clock)
 
     def close(self) -> None:
+        if self.closing:
+            return
+        self.closing = True
         if self.training:
             self.stop_training_event.set()
-        self.core_agent_stop.set()
+            self.status_var.set("STATE  STOPPING / SAVING MODEL BEFORE EXIT")
+            self.training_phase = "STATE STOPPING  |  SAVING BEST MODEL BEFORE EXIT"
         self.cashier_stop.set()
+        self._finish_close_when_safe()
+
+    def _finish_close_when_safe(self) -> None:
+        if self.operation_thread is not None and self.operation_thread.is_alive():
+            self.root.after(100, self._finish_close_when_safe)
+            return
+        self.core_agent_stop.set()
         self.root.destroy()
 
 

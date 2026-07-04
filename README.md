@@ -33,8 +33,8 @@ Binance public crypto downloads require no key. If no Massive key exists, the ap
 
 1. Use **Load Symbols** to select stocks or crypto and daily or one-minute bars.
 2. Select **Download Data**. Historical bars are cached in `market_cache/` as Parquet or CSV.
-3. Select **Start Training**. Missing data is downloaded automatically.
-4. Watch training/validation loss and accuracy or open the animated network trace.
+3. Select **Start Training**. Missing data is downloaded automatically, then training continues until you select **Stop Training**.
+4. Watch training/validation loss and accuracy or open the animated network trace. The best validation checkpoint is autosaved every ten epochs.
 5. Inspect live scores in **Rankings**.
 6. Add Alpaca paper keys and select **Start Paper Trading** to enable the Investor -> Cashier pipeline.
 
@@ -42,7 +42,7 @@ Binance public crypto downloads require no key. If no Massive key exists, the ap
 
 Each sample uses a 30-bar lookback summarized into 20 explainable features: return horizons and volatility, SMA gaps, RSI, MACD, ATR, volume change/ratio, candle range/body, momentum, rolling Sharpe, and sentiment. The network is `20 -> 32 -> 16 -> 3` for hold, buy, and sell.
 
-Every symbol is split chronologically before concatenation. Scaler statistics are fitted only on training windows. Training uses class-weighted cross entropy, gradient clipping, validation-based early stopping, and saves the best checkpoint to `models/trade_model.pt`. Checkpoints are validated and atomically replaced so the Investor never reads a partially written model. Training metrics are also written to SQLite.
+Every symbol is split chronologically before concatenation. Scaler statistics are fitted only on training windows. Training uses class-weighted cross entropy and gradient clipping, and runs continuously until manually stopped. The best validation checkpoint is autosaved every ten epochs and saved again when training stops. Checkpoints are validated and atomically replaced so the Investor never reads a partially written model. Training metrics are also written to SQLite.
 
 FinBERT is downloaded only when news is first processed and is cached under `models/finbert/`. If transformers or the model service is unavailable, the Researcher records a warning and uses a small deterministic lexical fallback instead of stopping the other agents.
 
@@ -50,7 +50,7 @@ Generated caches, SQLite files, models, logs, `.env`, and the virtual environmen
 
 ## Troubleshooting
 
-- Training automatically switches to the Training tab. `STATE MODEL READY / BEST EPOCH N` means the run succeeded. `EARLY STOP (NORMAL)` is expected: the best validation checkpoint was restored, not discarded.
+- Training automatically switches to the Training tab and continues until **Stop Training** is selected. `STATE MODEL SAVED / STOPPED / BEST EPOCH N` confirms the best checkpoint was preserved.
 - If cache preparation fails, the failed symbols and provider errors are shown in the event log. The controls unlock after the error is reported.
 - `https://paper-api.alpaca.markets/v2` is the paper endpoint, not an API key. Paper execution requires both values from the Alpaca paper dashboard in a local `.env` file. Restart the app after creating it.
 - Stock decisions wait while the US market is closed. Crypto decisions can execute continuously when the Alpaca paper account supports crypto.
