@@ -1,171 +1,59 @@
-# Universal AI Trading Bot
+# TradeMind Trainer
 
-Production-style scaffold for a multi-asset algorithmic trading system with data collection,
-strategy signals, asset ranking, professional risk controls, paper/live execution adapters,
-backtesting, scheduled retraining, and a secured web dashboard.
+A single-file Windows desktop application that downloads free Massive US-stock bars or free Binance crypto bars, builds leakage-safe market-feature windows, trains a shallow PyTorch classifier on CPU, and can execute US-stock signals against Alpaca's paper-money endpoint.
 
-The stack starts in paper mode with demo-safe defaults. Do not enable live trading until API
-keys, broker permissions, monitoring, and risk limits have been reviewed by a qualified human.
+This is research software, not investment advice. The model is intentionally simple and paper trading is permanently enabled in the source. It cannot connect to Alpaca's live-money endpoint.
 
-## Quick Start
+## Setup
 
-```bash
-cp .env.example .env
-docker compose up -d --build
-```
+1. Install 64-bit Python 3.11.
+2. Run `setup.bat`.
+3. Copy `.env.example` to `.env`.
+4. Add a free Massive Stocks Basic key as `MASSIVE_API_KEY` for stock downloads.
+5. Add Alpaca paper-account values only if paper execution is needed.
+6. Run `run.bat`.
 
-Open `http://localhost/` and sign in with the credentials in `.env`.
+Binance crypto downloads need no key. Alpaca credentials do not block downloads or training; they are only checked before paper execution. Recent free IEX bars are overlaid in memory for stock paper decisions and are never written into the Massive training cache.
 
-## Directory Tree
+## Workflow
 
-```text
-.
-|-- config/settings.yaml              # Strategy, universe, risk, broker, dashboard config
-|-- db/migrations/001_init.sql         # TimescaleDB schema and seed assets
-|-- deploy/trading-bot.service         # systemd unit for Ubuntu boot startup
-|-- docker/python.Dockerfile           # Shared Python runtime for backend services
-|-- docker/nginx/nginx.conf            # Reverse proxy for UI, API, and WebSocket
-|-- docker-compose.yml                 # db, redis, mongo, collectors, engines, API, UI, nginx
-|-- dashboard-ui/                      # React, MUI, Plotly dashboard
-|-- install.sh                         # Ubuntu installer for Docker and stack startup
-|-- src/trading_bot/
-|   |-- data/                          # yfinance, Polygon/Finnhub clients, MT5 adapter, cleaning
-|   |-- strategies/                    # Trend, momentum, mean reversion, LightGBM strategy classes
-|   |-- selection/                     # Universal daily 0-100 composite score
-|   |-- risk/                          # Daily loss, sizing, leverage, drawdown, correlation checks
-|   |-- backtest/                      # Vectorized backtester, metrics, walk-forward validation
-|   |-- execution/                     # PaperBroker and guarded Alpaca live adapter
-|   |-- ml/                            # Gaussian HMM regime detector
-|   |-- dashboard/api/                 # FastAPI REST + JWT + WebSocket
-|   `-- services/                      # Container entrypoints and Celery beat tasks
-`-- tests/                             # Focused pytest coverage for math and guardrails
-```
+1. **Load Symbols** selects `stocks` (Massive) or `crypto` (Binance), comma-separated symbols, and daily or one-minute bars. Use symbols such as `AAPL` or `BTCUSDT`.
+2. **Download Data** incrementally synchronizes OHLCV bars into `market_cache/`. Existing Parquet or CSV data is reused.
+3. **Start Training** engineers indicators, creates chronological windows and trains the CPU network.
+4. **Open Simulation** shows actual batch-majority labels moving through the 300→32→16→3 topology.
+5. **Start Paper Trading** requires an Alpaca stock-paper account, explicit confirmation, and a stock-trained model. Crypto order submission is intentionally disabled pending a separate crypto execution safety pass.
 
-## Services
+When no Massive key is configured, the app starts in keyless crypto mode with `BTCUSDT`, `ETHUSDT`, and `SOLUSDT`. With a Massive key present, it starts in stock mode with `AAPL`, `MSFT`, and `GOOGL`. Both providers request roughly two years of daily data or 90 days of minute data. Downloads are cached in Parquet with CSV fallback.
 
-`docker-compose.yml` defines the deployable stack:
+## Dataset and model
 
-- `db`: PostgreSQL + TimescaleDB for OHLCV, signals, trades, rankings, equity.
-- `redis`: tick cache, live updates, Celery broker.
-- `mongo`: news/sentiment article storage target.
-- `data_collector`: collects daily history through `YFinanceProvider` and extension clients.
-- `signal_engine`: ranks assets and runs all strategy classes.
-- `risk_manager`: central risk service skeleton with configured limits.
-- `broker`: paper broker service by default.
-- `scheduler`: Celery worker with beat for nightly model retraining and weekly walk-forward jobs.
-- `dashboard_api`: FastAPI REST and WebSocket backend.
-- `dashboard_ui`: React dashboard served by Nginx.
-- `nginx`: browser entrypoint and reverse proxy.
+Each sample contains the prior 30 bars of ten features:
 
-## Core Components
+- log return
+- 20-bar volatility
+- normalized 14-bar ATR
+- normalized 14-bar RSI
+- normalized MACD histogram
+- volume change
+- high-low range
+- open-close body
+- distance from 10-bar SMA
+- distance from 30-bar SMA
 
-Every strategy implements:
+The target uses the close five bars after the sample endpoint. The threshold is scaled to the market and timeframe: 0.2% for one-minute data, 0.5% for daily stocks, and 2% for daily crypto.
 
-```python
-def generate_signal(self, symbol: str, asset_df: pd.DataFrame) -> StrategySignal:
-    ...
-```
+- `BUY (1)` when the future return is above the configured positive threshold
+- `SELL (2)` when it is below the negative threshold
+- `HOLD (0)` otherwise
 
-Implemented strategies:
+Windows never contain future bars. Every symbol is split chronologically before concatenation, and normalization statistics are fitted only on training windows. The model is an explainable multilayer perceptron: 300 inputs, 32 hidden units, 16 hidden units, and three logits. Training stops after five validation epochs without improvement and `trade_model.pt` contains the best validation checkpoint rather than the final overfit epoch.
 
-- `TrendFollowingStrategy`: EMA 20/50 crossover, ADX filter, ATR stop/target.
-- `MomentumStrategy`: RSI oversold exit plus MACD histogram flip.
-- `MeanReversionStrategy`: Bollinger Band and z-score entry.
-- `MLDirectionStrategy`: LightGBM next-day direction probability with engineered features.
+## Paper execution
 
-The scoring engine in `src/trading_bot/selection/scoring.py` uses the requested weights:
+Paper mode polls once per minute and uses the first selected symbol. It checks Alpaca's market clock, computes the latest feature window, and performs long-only actions:
 
-- 20-day momentum: 25%
-- 5-day volume growth: 15%
-- ADX trend strength: 10%
-- inverse ATR/close: 10%
-- sentiment: 15%
-- 60-day Sharpe: 25%
+- BUY with no position: submit a one-share paper market order.
+- SELL with a position: submit a paper market order for the held quantity.
+- HOLD: no order.
 
-The risk manager in `src/trading_bot/risk/manager.py` enforces daily loss, drawdown,
-position sizing, max exposure, leverage, and correlation limits. Live adapters are explicitly
-guarded by `ENABLE_LIVE_TRADING=true`.
-
-## API
-
-The dashboard API exposes:
-
-- `POST /api/token`
-- `GET /api/portfolio`
-- `GET /api/risk`
-- `GET /api/rankings`
-- `GET /api/trades`
-- `WS /ws/live`
-
-JWT credentials are controlled by:
-
-```env
-DASHBOARD_USERNAME=admin
-DASHBOARD_PASSWORD=change-me
-JWT_SECRET=change-me-before-live
-```
-
-## Deployment on Ubuntu
-
-On a fresh Ubuntu 22.04 or 24.04 server:
-
-```bash
-sudo REPO_URL=https://github.com/you/universal-ai-trading-bot.git bash install.sh
-```
-
-Then edit `/opt/universal-ai-trading-bot/.env`, restart with:
-
-```bash
-cd /opt/universal-ai-trading-bot
-sudo docker compose up -d --build
-```
-
-The systemd unit is installed as `trading-bot.service`.
-
-## Data and Broker Notes
-
-- Stocks/ETFs can run through yfinance without keys for initial paper mode.
-- Polygon, Alpha Vantage, Finnhub, and NewsAPI keys are optional environment variables.
-- MetaTrader 5 is kept as an optional Python extra because MT5 support on Linux usually
-  requires broker-specific terminal setup or Wine. Install with `pip install -e ".[mt5]"` on
-  a compatible host and set `broker.metatrader5.enabled`.
-- Alpaca live trading requires `ENABLE_LIVE_TRADING=true`, Alpaca credentials, paper/live
-  account review, and startup reconciliation before use.
-
-## Development
-
-```bash
-python -m venv .venv
-. .venv/bin/activate
-pip install -e ".[runtime,dev]"
-pytest
-```
-
-Frontend:
-
-```bash
-cd dashboard-ui
-npm install
-npm run dev
-```
-
-## Professional Pitfalls and Solutions
-
-- Survivorship bias: store the historical universe and metadata snapshots instead of only
-  today's tradable symbols.
-- Vendor outages: collectors should persist raw provider payloads and mark source quality.
-- Split/dividend drift: use adjusted prices for research and raw prices for execution checks.
-- Overfitting: keep grids small and require out-of-sample Sharpe to retain at least 50% of
-  in-sample Sharpe.
-- Broker mismatch: reconcile positions and cash on startup before submitting new orders.
-- MT5 on Linux: isolate broker terminal setup from the main stack and treat it as an adapter.
-- Live risk failure: daily loss, drawdown, leverage, and correlation limits are central, not
-  per-strategy suggestions.
-- Secret leakage: never commit `.env`; rotate keys before enabling live trading.
-- Dashboard exposure: put SSL and firewall rules in front of Nginx for non-local deployment.
-
-## Next Production Hardening Steps
-
-This repo is ready to clone and boot as a paper-trading analytics stack. Before real capital,
-add broker-specific integration tests, provider data quality checks, persistent order-state
-machines, alerting, SSL certificate automation, and manual approval gates for live mode.
+The paper-account tab records signal confidence, price, position, account equity, session P&L and the submitted action. API calls retry transient rate-limit and server failures with exponential backoff.

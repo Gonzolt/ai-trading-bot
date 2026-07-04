@@ -1,17 +1,24 @@
-.env
-.venv/
+venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
-.ruff_cache/
-.mypy_cache/
-dist/
-build/
-*.egg-info/
-node_modules/
-dashboard-ui/dist/
-.coverage
-htmlcov/
-logs/
-data/
-*.sqlite
+.idea/
+.vscode/
+
+# Generated data, models, logs, and runtime controls
+data/headlines.csv
+results/
+runs/
+training_state.json
+stop_training.flag
+
+# TradeMind desktop model artifacts
+finbert_model/
+finbert_trained/
+.trademind_checkpoints/
+
+# Alpaca TradeMind runtime data and credentials
+.env
+market_cache/
+trade_model.pt
+runtime/
