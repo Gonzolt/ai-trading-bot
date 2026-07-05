@@ -421,6 +421,32 @@ def test_investor_skips_symbol_outside_trained_universe(tmp_path: Path):
     assert not database.query("SELECT 1 FROM investment_decisions")
 
 
+def test_investor_expires_stale_pending_signals_without_cashier(tmp_path: Path):
+    database = app.AgentDatabase(tmp_path / "investor-expiry.db")
+    decision_id = insert_decision(database, "BTCUSDT", app.ASSET_CRYPTO)
+    database.execute(
+        "UPDATE investment_decisions SET created_at=? WHERE id=?",
+        ("2020-01-01T00:00:00+00:00", decision_id),
+    )
+    investor = app.InvestorAgent(
+        database, app.queue.Queue(), app.threading.Event()
+    )
+    investor.checkpoint = {
+        "symbols": ["BTCUSDT"],
+        "asset_class": app.ASSET_CRYPTO,
+        "mean": [0.0] * len(app.MODEL_FEATURES),
+        "std": [1.0] * len(app.MODEL_FEATURES),
+        "timeframe": "1Min",
+    }
+    investor.model = object()
+    investor.evaluate_rankings()
+    decision = database.query(
+        "SELECT status,note FROM investment_decisions WHERE id=?", (decision_id,)
+    )[0]
+    assert decision["status"] == "expired"
+    assert "paper execution" in decision["note"]
+
+
 def test_universe_refresh_preserves_user_crypto_watchlist(tmp_path: Path, monkeypatch):
     database = app.AgentDatabase(tmp_path / "watchlist.db")
     watchlist = app.WatchlistState()

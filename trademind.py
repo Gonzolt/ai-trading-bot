@@ -1838,6 +1838,15 @@ class InvestorAgent(BaseAgent):
     def evaluate_rankings(self) -> None:
         if self.checkpoint is None or self.model is None:
             raise RuntimeError("Investor model is not loaded.")
+        cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=MAX_PENDING_DECISION_SECONDS)
+        ).isoformat()
+        self.database.execute(
+            "UPDATE investment_decisions SET status='expired', note=? "
+            "WHERE status='pending' AND (created_at='' OR created_at<?)",
+            ("signal expired before paper execution started", cutoff),
+        )
         rankings = self.database.query(
             "SELECT * FROM asset_rankings ORDER BY score DESC LIMIT 3"
         )
