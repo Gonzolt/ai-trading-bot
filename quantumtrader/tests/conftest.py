@@ -1,1 +1,0 @@
-# QuantumTrader tests

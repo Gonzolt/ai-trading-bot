@@ -1,171 +1,60 @@
-# Universal AI Trading Bot
+# Korvax TradeMind
 
-Production-style scaffold for a multi-asset algorithmic trading system with data collection,
-strategy signals, asset ranking, professional risk controls, paper/live execution adapters,
-backtesting, scheduled retraining, and a secured web dashboard.
+Korvax TradeMind is a single-file, CPU-only Windows desktop application for market research, neural-network training, and Alpaca paper execution. It coordinates four daemon agents through a local SQLite database while Tkinter remains on the main UI thread.
 
-The stack starts in paper mode with demo-safe defaults. Do not enable live trading until API
-keys, broker permissions, monitoring, and risk limits have been reviewed by a qualified human.
+This is research software, not investment advice. Alpaca is always created with `paper=True`; no live-money endpoint exists in the application.
 
-## Quick Start
+## Architecture
 
-```bash
-cp .env.example .env
-docker compose up -d --build
-```
+- **Researcher** polls Alpaca IEX stock bars and keyless Binance crypto bars, gathers Finnhub or Yahoo RSS news, and scores headlines with a lazily downloaded local `ProsusAI/finbert` model.
+- **Analyst** uses Polars/Pandas and `ta` to calculate RSI, MACD, ATR, ADX, momentum, volume ratio and rolling Sharpe. It publishes a weighted 0-100 ranking for the top ten assets.
+- **Investor** loads the local `20 -> 32 -> 16 -> 3` PyTorch model, evaluates the top three assets, and records ATR-derived decisions.
+- **Cashier** is started only after explicit confirmation. It submits paper orders while enforcing 1% equity risk per trade, a 25% per-asset cap, a 2% daily-loss halt, sector concentration limits, and a 20% global drawdown halt.
+- **Monitor** is the Tkinter UI, live charts, logs, rankings, P&L table, and animated network trace.
 
-Open `http://localhost/` and sign in with the credentials in `.env`.
+Agents communicate through `trademind.db` in SQLite WAL mode using `live_prices`, `research_findings`, `asset_rankings`, `investment_decisions`, `portfolio_log`, `training_log`, and `agent_logs` tables.
 
-## Directory Tree
+## Setup
 
-```text
-.
-|-- config/settings.yaml              # Strategy, universe, risk, broker, dashboard config
-|-- db/migrations/001_init.sql         # TimescaleDB schema and seed assets
-|-- deploy/trading-bot.service         # systemd unit for Ubuntu boot startup
-|-- docker/python.Dockerfile           # Shared Python runtime for backend services
-|-- docker/nginx/nginx.conf            # Reverse proxy for UI, API, and WebSocket
-|-- docker-compose.yml                 # db, redis, mongo, collectors, engines, API, UI, nginx
-|-- dashboard-ui/                      # React, MUI, Plotly dashboard
-|-- install.sh                         # Ubuntu installer for Docker and stack startup
-|-- src/trading_bot/
-|   |-- data/                          # yfinance, Polygon/Finnhub clients, MT5 adapter, cleaning
-|   |-- strategies/                    # Trend, momentum, mean reversion, LightGBM strategy classes
-|   |-- selection/                     # Universal daily 0-100 composite score
-|   |-- risk/                          # Daily loss, sizing, leverage, drawdown, correlation checks
-|   |-- backtest/                      # Vectorized backtester, metrics, walk-forward validation
-|   |-- execution/                     # PaperBroker and guarded Alpaca live adapter
-|   |-- ml/                            # Gaussian HMM regime detector
-|   |-- dashboard/api/                 # FastAPI REST + JWT + WebSocket
-|   `-- services/                      # Container entrypoints and Celery beat tasks
-`-- tests/                             # Focused pytest coverage for math and guardrails
-```
+1. Install 64-bit Python 3.11.
+2. Run `setup.bat`.
+3. Optionally copy `.env.example` to `.env` and enter keys locally.
+4. Run `run.bat`.
 
-## Services
+API keys are never committed:
 
-`docker-compose.yml` defines the deployable stack:
+- `MASSIVE_API_KEY`: optional free Massive Stocks Basic key for historical stock training data.
+- `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY`: required for Alpaca stock streaming and paper execution.
+- `FINNHUB_API_KEY`: optional; Yahoo Finance RSS is the news fallback.
 
-- `db`: PostgreSQL + TimescaleDB for OHLCV, signals, trades, rankings, equity.
-- `redis`: tick cache, live updates, Celery broker.
-- `mongo`: news/sentiment article storage target.
-- `data_collector`: collects daily history through `YFinanceProvider` and extension clients.
-- `signal_engine`: ranks assets and runs all strategy classes.
-- `risk_manager`: central risk service skeleton with configured limits.
-- `broker`: paper broker service by default.
-- `scheduler`: Celery worker with beat for nightly model retraining and weekly walk-forward jobs.
-- `dashboard_api`: FastAPI REST and WebSocket backend.
-- `dashboard_ui`: React dashboard served by Nginx.
-- `nginx`: browser entrypoint and reverse proxy.
+Binance public crypto downloads require no key. If no Massive key exists, the app starts with 90 days of one-minute data for `BTCUSDT`, `ETHUSDT`, `SOLUSDT`, `BNBUSDT`, `XRPUSDT`, and `ADAUSDT`.
 
-## Core Components
+## Workflow
 
-Every strategy implements:
+1. Use **Load Symbols** to select stocks or crypto and daily or one-minute bars.
+2. Select **Download Data**. Historical bars are cached in `market_cache/` as Parquet or CSV.
+3. Select **Start Training**. Missing data is downloaded automatically, then training continues until you select **Stop Training**.
+4. Watch training/validation loss and accuracy or open the animated network trace. The best validation checkpoint is autosaved every ten epochs.
+5. Inspect live scores in **Rankings**.
+6. Add Alpaca paper keys and select **Start Paper Trading** to enable the Investor -> Cashier pipeline.
 
-```python
-def generate_signal(self, symbol: str, asset_df: pd.DataFrame) -> StrategySignal:
-    ...
-```
+## Model and data safety
 
-Implemented strategies:
+Each sample uses a 30-bar lookback summarized into 20 explainable features: return horizons and volatility, SMA gaps, RSI, MACD, ATR, volume change/ratio, candle range/body, momentum, rolling Sharpe, and sentiment. The network is `20 -> 32 -> 16 -> 3` for hold, buy, and sell.
 
-- `TrendFollowingStrategy`: EMA 20/50 crossover, ADX filter, ATR stop/target.
-- `MomentumStrategy`: RSI oversold exit plus MACD histogram flip.
-- `MeanReversionStrategy`: Bollinger Band and z-score entry.
-- `MLDirectionStrategy`: LightGBM next-day direction probability with engineered features.
+Every symbol is split chronologically before concatenation. Scaler statistics are fitted only on training windows. The five-bar target uses the price exactly five bars ahead. One-minute crypto labels use a 0.05% threshold to avoid a hold-dominated dataset. Training uses balanced sampling, 20% dropout, 5% label smoothing, gradient clipping, and adaptive learning-rate reduction, and runs continuously until manually stopped. Best-model selection prioritizes validation macro-F1, with accuracy, confusion matrices, learning rate, and loss recorded in SQLite. The best checkpoint is autosaved every ten epochs and saved again when training stops. Checkpoints are validated and atomically replaced so the Investor never reads a partially written model.
 
-The scoring engine in `src/trading_bot/selection/scoring.py` uses the requested weights:
+Checkpoints contain tensors and JSON-safe primitives only and are loaded with PyTorch's restricted `weights_only=True` mode. Trading is limited to the model's recorded symbols and asset class. Stock entries use whole-share native Alpaca bracket orders, while filled crypto entries retain stale-price-aware client-side stops because Alpaca does not support crypto brackets. Broker order states are reconciled into SQLite before synthetic risk monitoring.
 
-- 20-day momentum: 25%
-- 5-day volume growth: 15%
-- ADX trend strength: 10%
-- inverse ATR/close: 10%
-- sentiment: 15%
-- 60-day Sharpe: 25%
+Pending signals expire after five minutes and duplicate pending orders per symbol are suppressed. Binance monthly archive gaps automatically fall back to daily files, and training windows never cross timestamp discontinuities. FinBERT is pinned to a reviewed Hugging Face revision. Setup installs audited PyTorch 2.12 and Transformers 5.x versions required for safe local model loading.
 
-The risk manager in `src/trading_bot/risk/manager.py` enforces daily loss, drawdown,
-position sizing, max exposure, leverage, and correlation limits. Live adapters are explicitly
-guarded by `ENABLE_LIVE_TRADING=true`.
+FinBERT is downloaded only when news is first processed and is cached under `models/finbert/`. If transformers or the model service is unavailable, the Researcher records a warning and uses a small deterministic lexical fallback instead of stopping the other agents.
 
-## API
+Generated caches, SQLite files, models, logs, `.env`, and the virtual environment are excluded from Git.
 
-The dashboard API exposes:
+## Troubleshooting
 
-- `POST /api/token`
-- `GET /api/portfolio`
-- `GET /api/risk`
-- `GET /api/rankings`
-- `GET /api/trades`
-- `WS /ws/live`
-
-JWT credentials are controlled by:
-
-```env
-DASHBOARD_USERNAME=admin
-DASHBOARD_PASSWORD=change-me
-JWT_SECRET=change-me-before-live
-```
-
-## Deployment on Ubuntu
-
-On a fresh Ubuntu 22.04 or 24.04 server:
-
-```bash
-sudo REPO_URL=https://github.com/you/universal-ai-trading-bot.git bash install.sh
-```
-
-Then edit `/opt/universal-ai-trading-bot/.env`, restart with:
-
-```bash
-cd /opt/universal-ai-trading-bot
-sudo docker compose up -d --build
-```
-
-The systemd unit is installed as `trading-bot.service`.
-
-## Data and Broker Notes
-
-- Stocks/ETFs can run through yfinance without keys for initial paper mode.
-- Polygon, Alpha Vantage, Finnhub, and NewsAPI keys are optional environment variables.
-- MetaTrader 5 is kept as an optional Python extra because MT5 support on Linux usually
-  requires broker-specific terminal setup or Wine. Install with `pip install -e ".[mt5]"` on
-  a compatible host and set `broker.metatrader5.enabled`.
-- Alpaca live trading requires `ENABLE_LIVE_TRADING=true`, Alpaca credentials, paper/live
-  account review, and startup reconciliation before use.
-
-## Development
-
-```bash
-python -m venv .venv
-. .venv/bin/activate
-pip install -e ".[runtime,dev]"
-pytest
-```
-
-Frontend:
-
-```bash
-cd dashboard-ui
-npm install
-npm run dev
-```
-
-## Professional Pitfalls and Solutions
-
-- Survivorship bias: store the historical universe and metadata snapshots instead of only
-  today's tradable symbols.
-- Vendor outages: collectors should persist raw provider payloads and mark source quality.
-- Split/dividend drift: use adjusted prices for research and raw prices for execution checks.
-- Overfitting: keep grids small and require out-of-sample Sharpe to retain at least 50% of
-  in-sample Sharpe.
-- Broker mismatch: reconcile positions and cash on startup before submitting new orders.
-- MT5 on Linux: isolate broker terminal setup from the main stack and treat it as an adapter.
-- Live risk failure: daily loss, drawdown, leverage, and correlation limits are central, not
-  per-strategy suggestions.
-- Secret leakage: never commit `.env`; rotate keys before enabling live trading.
-- Dashboard exposure: put SSL and firewall rules in front of Nginx for non-local deployment.
-
-## Next Production Hardening Steps
-
-This repo is ready to clone and boot as a paper-trading analytics stack. Before real capital,
-add broker-specific integration tests, provider data quality checks, persistent order-state
-machines, alerting, SSL certificate automation, and manual approval gates for live mode.
+- Training automatically switches to the Training tab and continues until **Stop Training** is selected. `STATE MODEL SAVED / STOPPED / BEST EPOCH N` confirms the best checkpoint was preserved.
+- If cache preparation fails, the failed symbols and provider errors are shown in the event log. The controls unlock after the error is reported.
+- `https://paper-api.alpaca.markets/v2` is the paper endpoint, not an API key. Paper execution requires both values from the Alpaca paper dashboard in a local `.env` file. Restart the app after creating it.
+- Stock decisions wait while the US market is closed. Crypto decisions can execute continuously when the Alpaca paper account supports crypto.
