@@ -25,7 +25,7 @@ def insert_decision(
     return database.execute(
         "INSERT INTO investment_decisions"
         "(symbol,asset_type,timestamp,signal,probability,price,atr,stop_loss,"
-        "take_profit,status,client_order_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        "take_profit,status,client_order_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             symbol,
             asset_type,
@@ -38,6 +38,7 @@ def insert_decision(
             price + 3 * atr,
             status,
             client_order_id,
+            datetime.now(timezone.utc).isoformat(),
         ),
     )
 
@@ -124,6 +125,15 @@ def test_vectorized_windows_match_single_window_feature_builder():
     windows, _ = app.symbol_windows(frame)
     assert expected is not None
     assert np.allclose(windows[-1], expected, rtol=1e-5, atol=1e-7)
+
+
+def test_training_windows_do_not_cross_timestamp_gaps():
+    contiguous = market_frame("BTCUSDT")
+    gapped = contiguous.copy()
+    gapped.loc[300:, "timestamp"] += pd.Timedelta(days=30)
+    contiguous_windows, _ = app.symbol_windows(contiguous)
+    gapped_windows, _ = app.symbol_windows(gapped)
+    assert len(gapped_windows) <= len(contiguous_windows) - app.LOOKBACK
 
 
 def test_chronological_windows_and_training_only_scaler():
@@ -241,6 +251,26 @@ def test_stock_decision_waits_while_market_is_closed(tmp_path: Path):
         "SELECT status FROM investment_decisions WHERE id=?", (decision_id,)
     )[0]
     assert decision["status"] == "pending"
+    assert not cashier.client.submitted
+
+
+def test_stale_pending_decision_expires_without_submission(tmp_path: Path):
+    database = app.AgentDatabase(tmp_path / "stale-decision.db")
+    decision_id = insert_decision(database, "BTCUSDT", app.ASSET_CRYPTO)
+    database.execute(
+        "UPDATE investment_decisions SET created_at=? WHERE id=?",
+        ("2020-01-01T00:00:00+00:00", decision_id),
+    )
+    cashier = app.CashierAgent(database, app.queue.Queue(), app.threading.Event())
+    cashier.client = FakeTradingClient()
+    cashier.start_equity = cashier.peak_equity = 100_000.0
+    cashier.trained_symbols = {"BTCUSDT"}
+    cashier.trained_asset = app.ASSET_CRYPTO
+    cashier.process_pending()
+    status = database.query(
+        "SELECT status FROM investment_decisions WHERE id=?", (decision_id,)
+    )[0]["status"]
+    assert status == "expired"
     assert not cashier.client.submitted
 
 
@@ -577,3 +607,31 @@ def test_binance_archive_supports_microsecond_timestamps():
     assert frame.loc[0, "symbol"] == "BTCUSDT"
     assert frame.loc[0, "close"] == 42500.0
     assert frame.loc[0, "timestamp"].year == 2025
+
+
+def test_missing_binance_month_uses_daily_archive_fallback(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(app, "CACHE_DIR", tmp_path)
+    calls = []
+
+    def fake_archive(symbol, interval, cadence, stamp, events):
+        calls.append((cadence, stamp))
+        if cadence == "monthly":
+            return None
+        timestamp = pd.Timestamp(stamp, tz="UTC")
+        return pd.DataFrame(
+            {
+                "timestamp": [timestamp],
+                "symbol": [symbol],
+                "open": [100.0],
+                "high": [101.0],
+                "low": [99.0],
+                "close": [100.5],
+                "volume": [10.0],
+            }
+        )
+
+    monkeypatch.setattr(app, "_binance_archive", fake_archive)
+    result = app.sync_binance_crypto_bars("BTCUSDT", "1Min", force_refresh=True)
+    assert not result.empty
+    assert any(cadence == "monthly" for cadence, _ in calls)
+    assert any(cadence == "daily" for cadence, _ in calls)

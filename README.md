@@ -46,6 +46,8 @@ Every symbol is split chronologically before concatenation. Scaler statistics ar
 
 Checkpoints contain tensors and JSON-safe primitives only and are loaded with PyTorch's restricted `weights_only=True` mode. Trading is limited to the model's recorded symbols and asset class. Stock entries use whole-share native Alpaca bracket orders, while filled crypto entries retain stale-price-aware client-side stops because Alpaca does not support crypto brackets. Broker order states are reconciled into SQLite before synthetic risk monitoring.
 
+Pending signals expire after five minutes and duplicate pending orders per symbol are suppressed. Binance monthly archive gaps automatically fall back to daily files, and training windows never cross timestamp discontinuities. FinBERT is pinned to a reviewed Hugging Face revision. Setup installs audited PyTorch 2.12 and Transformers 5.x versions required for safe local model loading.
+
 FinBERT is downloaded only when news is first processed and is cached under `models/finbert/`. If transformers or the model service is unavailable, the Researcher records a warning and uses a small deterministic lexical fallback instead of stopping the other agents.
 
 Generated caches, SQLite files, models, logs, `.env`, and the virtual environment are excluded from Git.

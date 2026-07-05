@@ -12,17 +12,14 @@ import sqlite3
 import threading
 import time
 import tkinter as tk
-import urllib.error
 import urllib.parse
-import urllib.request
 import zipfile
-import xml.etree.ElementTree as ET
 from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import messagebox, ttk
-from typing import Callable, TypeVar
+from typing import Callable, Literal, TypeVar
 from zoneinfo import ZoneInfo
 
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -50,6 +47,7 @@ from alpaca.trading.requests import (
     TakeProfitRequest,
 )
 from dotenv import load_dotenv
+from defusedxml import ElementTree as ET
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from ta.momentum import RSIIndicator
@@ -133,6 +131,7 @@ MAX_CRYPTO_POSITIONS = 3
 TRADE_TRAINED_SYMBOLS_ONLY = True
 MIN_SIGNAL_CONFIDENCE = 0.45
 DECISION_COOLDOWN_SECONDS = 60
+MAX_PENDING_DECISION_SECONDS = 300
 MIN_ORDER_QUANTITY = 0.0001
 CRYPTO_RETRY_SECONDS = 60
 MAX_PRICE_AGE_SECONDS = 180
@@ -144,6 +143,7 @@ CACHE_DIR = ROOT / "market_cache"
 MODEL_DIR = ROOT / "models"
 MODEL_PATH = MODEL_DIR / "trade_model.pt"
 FINBERT_DIR = MODEL_DIR / "finbert"
+FINBERT_REVISION = "4556d13015211d73dccd3fdd39d39232506f3e43"
 DB_PATH = ROOT / "trademind.db"
 ENV_PATH = ROOT / ".env"
 
@@ -354,23 +354,33 @@ def http_get_bytes(
     missing_ok: bool = False,
 ) -> bytes | None:
     def request() -> bytes | None:
+        if requests is None:
+            raise UserFacingError("The requests package is required for HTTP downloads.")
         try:
-            req = urllib.request.Request(
+            response = requests.get(
                 url,
                 headers={"User-Agent": "TradeMind/1.0", **(headers or {})},
+                timeout=60,
             )
-            with urllib.request.urlopen(req, timeout=60) as response:
-                return response.read()
-        except urllib.error.HTTPError as exc:
-            if missing_ok and exc.code == 404:
+            if missing_ok and response.status_code == 404:
                 return None
-            detail = exc.read().decode("utf-8", errors="replace")[:300]
-            raise HttpRequestError(
-                f"{context} failed with HTTP {exc.code}: {detail or exc.reason}",
-                exc.code,
-            ) from exc
-        except urllib.error.URLError as exc:
-            raise UserFacingError(f"{context} network error: {exc.reason}") from exc
+            if response.status_code >= 400:
+                detail = response.text[:300]
+                raise HttpRequestError(
+                    f"{context} failed with HTTP {response.status_code}: "
+                    f"{detail or response.reason}",
+                    response.status_code,
+                )
+            return response.content
+        except requests.RequestException as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if missing_ok and status == 404:
+                return None
+            if status is not None:
+                raise HttpRequestError(
+                    f"{context} failed with HTTP {status}: {exc}", int(status)
+                ) from exc
+            raise UserFacingError(f"{context} network error: {exc}") from exc
 
     return call_with_backoff(request, events, context)
 
@@ -650,7 +660,7 @@ def sync_binance_crypto_bars(
     )
     start = (
         cached["timestamp"].iloc[-1].to_pydatetime()
-        if not cached.empty
+        if not cached.empty and not force_refresh
         else now - timedelta(days=history_days)
     )
     end_date = (now - timedelta(days=1)).date()
@@ -665,6 +675,20 @@ def sync_binance_crypto_bars(
             frame = _binance_archive(symbol, interval, "monthly", str(month), events)
             if frame is None:
                 missing_archives += 1
+                fallback_start = max(start.date(), month.start_time.date())
+                fallback_end = min(end_date, month.end_time.date())
+                for day in pd.date_range(fallback_start, fallback_end, freq="D"):
+                    daily = _binance_archive(
+                        symbol,
+                        interval,
+                        "daily",
+                        day.date().isoformat(),
+                        events,
+                    )
+                    if daily is None:
+                        missing_archives += 1
+                    else:
+                        frames.append(daily)
             else:
                 frames.append(frame)
 
@@ -967,6 +991,14 @@ def symbol_windows(
     )
     targets = featured["target"].to_numpy(dtype=np.float64)
     valid = np.isfinite(matrix).all(axis=1) & np.isfinite(targets)
+    timestamps = featured["timestamp"]
+    deltas = timestamps.diff().dt.total_seconds()
+    normal_interval = float(deltas[deltas > 0].median()) if (deltas > 0).any() else 0.0
+    if normal_interval > 0:
+        for gap_index in np.flatnonzero(deltas.to_numpy() > normal_interval * 2):
+            invalid_start = max(0, int(gap_index) - FORWARD_HORIZON)
+            invalid_end = min(len(valid), int(gap_index) + LOOKBACK)
+            valid[invalid_start:invalid_end] = False
     if not valid.any():
         return (
             np.empty((0, len(MODEL_FEATURES)), dtype=np.float32),
@@ -1087,11 +1119,12 @@ def save_checkpoint_atomic(checkpoint: dict, path: Path = MODEL_PATH) -> None:
 class ClosingSQLiteConnection(sqlite3.Connection):
     """Commit/rollback like sqlite3, then release the Windows file handle."""
 
-    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+    def __exit__(self, exc_type, exc_value, traceback) -> Literal[False]:
         try:
-            return bool(super().__exit__(exc_type, exc_value, traceback))
+            super().__exit__(exc_type, exc_value, traceback)
         finally:
             self.close()
+        return False
 
 
 class AgentDatabase:
@@ -1160,7 +1193,8 @@ class AgentDatabase:
             status TEXT NOT NULL DEFAULT 'pending',
             note TEXT NOT NULL DEFAULT '',
             client_order_id TEXT NOT NULL DEFAULT '',
-            filled_quantity REAL NOT NULL DEFAULT 0
+            filled_quantity REAL NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_decision_status
             ON investment_decisions(status, timestamp);
@@ -1241,6 +1275,11 @@ class AgentDatabase:
                     connection.execute(
                         "ALTER TABLE investment_decisions ADD COLUMN "
                         "filled_quantity REAL NOT NULL DEFAULT 0"
+                    )
+                if "created_at" not in decision_columns:
+                    connection.execute(
+                        "ALTER TABLE investment_decisions ADD COLUMN "
+                        "created_at TEXT NOT NULL DEFAULT ''"
                     )
         finally:
             connection.close()
@@ -1353,11 +1392,13 @@ class FinBERTSentiment:
                 )
                 self.tokenizer = AutoTokenizer.from_pretrained(
                     "ProsusAI/finbert",
+                    revision=FINBERT_REVISION,
                     cache_dir=FINBERT_DIR,
                     local_files_only=has_cache,
                 )
                 self.model = AutoModelForSequenceClassification.from_pretrained(
                     "ProsusAI/finbert",
+                    revision=FINBERT_REVISION,
                     cache_dir=FINBERT_DIR,
                     local_files_only=has_cache,
                 ).to("cpu")
@@ -1384,7 +1425,8 @@ class FinBERTSentiment:
     def score(self, text: str) -> tuple[str, float]:
         if not self._load():
             return self._lexical(text)
-        assert self.tokenizer is not None and self.model is not None
+        if self.tokenizer is None or self.model is None:
+            raise RuntimeError("FinBERT reported ready without tokenizer/model state.")
         encoded = self.tokenizer(
             text, return_tensors="pt", truncation=True, padding=True, max_length=128
         )
@@ -1794,7 +1836,8 @@ class InvestorAgent(BaseAgent):
         self.log("agent stopped")
 
     def evaluate_rankings(self) -> None:
-        assert self.checkpoint is not None and self.model is not None
+        if self.checkpoint is None or self.model is None:
+            raise RuntimeError("Investor model is not loaded.")
         rankings = self.database.query(
             "SELECT * FROM asset_rankings ORDER BY score DESC LIMIT 3"
         )
@@ -1868,6 +1911,12 @@ class InvestorAgent(BaseAgent):
             now = time.monotonic()
             if now - self.last_decision.get(symbol, 0.0) < DECISION_COOLDOWN_SECONDS:
                 continue
+            if self.database.query(
+                "SELECT 1 FROM investment_decisions WHERE symbol=? "
+                "AND status IN ('pending','submitted','partially_filled') LIMIT 1",
+                (symbol,),
+            ):
+                continue
             featured = engineer_features(frame, include_target=False)
             atr_values = featured["atr_14_pct"].dropna()
             if atr_values.empty:
@@ -1877,8 +1926,8 @@ class InvestorAgent(BaseAgent):
             target = price + 3 * atr if signal == 1 else price - 3 * atr
             self.database.execute(
                 "INSERT INTO investment_decisions"
-                "(symbol,asset_type,timestamp,signal,probability,price,atr,stop_loss,take_profit,status) "
-                "VALUES(?,?,?,?,?,?,?,?,?,'pending')",
+                "(symbol,asset_type,timestamp,signal,probability,price,atr,stop_loss,"
+                "take_profit,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,'pending',?)",
                 (
                     symbol,
                     ranking["asset_type"],
@@ -1889,6 +1938,7 @@ class InvestorAgent(BaseAgent):
                     atr,
                     stop,
                     target,
+                    datetime.now(timezone.utc).isoformat(),
                 ),
             )
             self.last_decision[symbol] = now
@@ -2003,7 +2053,8 @@ class CashierAgent(BaseAgent):
         return True, "approved"
 
     def process_pending(self) -> None:
-        assert self.client is not None
+        if self.client is None:
+            raise RuntimeError("Cashier paper client is not connected.")
         account = call_with_backoff(
             self.client.get_account, self.events, "paper account"
         )
@@ -2014,6 +2065,22 @@ class CashierAgent(BaseAgent):
             "SELECT * FROM investment_decisions WHERE status='pending' ORDER BY id LIMIT 10"
         )
         for decision in decisions:
+            created_at = str(decision["created_at"] or "")
+            try:
+                created = pd.Timestamp(created_at)
+                if created.tzinfo is None:
+                    created = created.tz_localize("UTC")
+                decision_age = (
+                    pd.Timestamp.now(tz="UTC") - created.tz_convert("UTC")
+                ).total_seconds()
+            except (TypeError, ValueError):
+                decision_age = float("inf")
+            if decision_age > MAX_PENDING_DECISION_SECONDS:
+                self.database.execute(
+                    "UPDATE investment_decisions SET status='expired', note=? WHERE id=?",
+                    (f"signal expired before execution age={decision_age:.0f}s", decision["id"]),
+                )
+                continue
             asset_type = normalize_asset_type(str(decision["asset_type"]))
             decision_symbol = str(decision["symbol"]).upper()
             if TRADE_TRAINED_SYMBOLS_ONLY and (
@@ -2192,7 +2259,8 @@ class CashierAgent(BaseAgent):
             self.log(f"paper {signal} submitted {symbol} qty={quantity:.6g}")
 
     def reconcile_orders(self) -> None:
-        assert self.client is not None
+        if self.client is None:
+            raise RuntimeError("Cashier paper client is not connected.")
         decisions = self.database.query(
             "SELECT * FROM investment_decisions "
             "WHERE status IN ('submitted','partially_filled') AND client_order_id<>''"
@@ -2234,7 +2302,8 @@ class CashierAgent(BaseAgent):
                 self.log(f"order {client_order_id} reconciled as {status}", "WARN")
 
     def monitor_risk(self) -> None:
-        assert self.client is not None
+        if self.client is None:
+            raise RuntimeError("Cashier paper client is not connected.")
         self.reconcile_orders()
         account = call_with_backoff(
             self.client.get_account, self.events, "paper account"
@@ -2717,8 +2786,13 @@ class MainApp:
             for timeframe in (self.timeframe, "1Day", "1Min"):
                 try:
                     frame = read_cached_bars(symbol, timeframe).tail(500)
-                except Exception:
-                    continue
+                except Exception as exc:
+                    frame = normalise_bar_frame(pd.DataFrame(), symbol)
+                    self.database.log(
+                        "monitor",
+                        f"cache seed skipped {symbol} {timeframe}: {exc}",
+                        "WARN",
+                    )
                 if frame.empty:
                     continue
                 rows = [
@@ -3075,8 +3149,10 @@ class MainApp:
         for symbol in self.symbols:
             try:
                 cache_rows += len(read_cached_bars(symbol, self.timeframe))
-            except Exception:
-                pass
+            except Exception as exc:
+                self.logs.append(
+                    f"{time.strftime('%H:%M:%S')}  META   | cache read failed {symbol}: {exc}"
+                )
         if self.asset_class == "stocks":
             data_source = (
                 "MASSIVE READY" if self._massive_credentials_present() else "YAHOO FALLBACK"
@@ -3097,8 +3173,10 @@ class MainApp:
         self.logs.append(f"{time.strftime('%H:%M:%S')}  {message}")
         try:
             self.database.log("monitor", message)
-        except Exception:
-            pass
+        except Exception as exc:
+            self.logs.append(
+                f"{time.strftime('%H:%M:%S')}  LOGGING| database unavailable: {exc}"
+            )
         self.log_box.delete(0, tk.END)
         for line in self.logs:
             self.log_box.insert(tk.END, line)
